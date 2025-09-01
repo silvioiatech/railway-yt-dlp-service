@@ -129,9 +129,10 @@ def upload_to_drive(local_path: Path, out_name: str) -> dict:
     if not DRIVE:
         raise RuntimeError("Drive not configured: set DRIVE_SERVICE_ACCOUNT_JSON and DRIVE_FOLDER_ID")
 
-    file_metadata = {"name": out_name}
-    if DRIVE_FOLDER_ID:
-        file_metadata["parents"] = [DRIVE_FOLDER_ID]
+   file_metadata = {
+        "name": out_name,
+        "parents": ["11k-Jc_D3ENyVX6umH3fHslsI-kgHdMZO"]
+    }
 
     media = MediaFileUpload(str(local_path), mimetype="video/mp4", resumable=True)
     created = DRIVE.files().create(
