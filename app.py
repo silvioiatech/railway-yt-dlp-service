@@ -2,6 +2,7 @@ import os
 import re
 import json
 import asyncio
+import base64
 import subprocess
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -17,9 +18,10 @@ TIMEOUT_SEC = int(os.getenv("TIMEOUT_SEC", "1800"))
 
 # Service Account JSON (from env var or file)
 service_json_str = os.getenv("DRIVE_SERVICE_ACCOUNT_JSON")
-if not service_json_str and os.path.exists("service_account.json"):
-    with open("service_account.json", "r") as f:
-        service_json_str = f.read()
+if not service_json_str:
+    b64 = os.getenv("DRIVE_SERVICE_ACCOUNT_JSON_B64")
+    if b64:
+        service_json_str = base64.b64decode(b64).decode("utf-8")
 
 creds = None
 if service_json_str:
