@@ -1,15 +1,15 @@
-# app.py (excerpt)
-import os
-from fastapi import FastAPI, HTTPException
+import os, re, json, subprocess, asyncio, httpx
+from typing import Optional, Dict
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
-from typing import Optional
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from google.oauth2.service_account import Credentials
 
 app = FastAPI()
 
-# -------- Google Drive auth (Service Account) ----------
+BEST_FORMAT = "bv*+ba/bestvideo+bestaudio/best"
+
 def build_drive():
     scopes = ["https://www.googleapis.com/auth/drive.file"]
     sa_path = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "/app/service_account.json")
@@ -18,97 +18,108 @@ def build_drive():
     creds = Credentials.from_service_account_file(sa_path, scopes=scopes)
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
-# -------- Model for /download body ----------
 class DownloadReq(BaseModel):
     url: str
     tag: Optional[str] = None
-    expected_name: Optional[str] = None   # <— allow client to force final name
-    drive_parent: Optional[str] = None    # <— optional override folder
+    expected_name: Optional[str] = None
+    drive_parent: Optional[str] = None
     callback_url: Optional[str] = None
 
-# -------- Helper: pick best quality format for Rumble ----------
-BEST_FORMAT = "bv*+ba/bestvideo+bestaudio/best"
+@app.get("/health")
+def health():
+    return {"ok": True}
 
-# -------- Main worker (simplified) ----------
-def run_download_and_upload(url: str, out_name: str, drive_parent: Optional[str]) -> dict:
-    tmp_dir = "/data"  # or /data/videos if you prefer
-    os.makedirs(tmp_dir, exist_ok=True)
+def derive_id(u: str) -> str:
+    m = re.search(r"/(v[0-9a-z]+)", u, re.I)
+    return m.group(1).lower() if m else "vid"
 
-    # Download with yt-dlp to temp path
-    # -N 8 parallel segments; adjust if needed
-    tmp_path = os.path.join(tmp_dir, out_name)
+def slug(s: str, n: int = 15) -> str:
+    sl = re.sub(r"[^A-Za-z0-9]+", "_", s.lower()).strip("_")
+    return sl[:n]
+
+def download_video(url: str, out_path: str) -> None:
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
     cmd = [
         "yt-dlp",
         "-f", BEST_FORMAT,
-        "-o", tmp_path,
+        "-o", out_path,
         "--no-part",
         "--merge-output-format", "mp4",
         url,
     ]
-    import subprocess
     r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if r.returncode != 0:
-        raise RuntimeError(f"yt-dlp failed: {r.stderr[:800]}")
+        raise RuntimeError(f"yt-dlp failed: {r.stderr[:1000]}")
 
-    # Upload to Drive
+def upload_to_drive(local_path: str, out_name: str, parent: Optional[str]) -> Dict[str, str]:
     drive = build_drive()
-    file_metadata = {
-        "name": out_name
-    }
-    # Prefer request drive_parent, otherwise env DRIVE_FOLDER_ID
-    folder_id = drive_parent or os.environ.get("DRIVE_FOLDER_ID")
+    file_metadata = {"name": out_name}
+    folder_id = parent or os.environ.get("DRIVE_FOLDER_ID")
     if folder_id:
         file_metadata["parents"] = [folder_id]
-
-    media = MediaFileUpload(tmp_path, mimetype="video/mp4", resumable=True)
+    media = MediaFileUpload(local_path, mimetype="video/mp4", resumable=True)
     created = drive.files().create(body=file_metadata, media_body=media, fields="id, webViewLink").execute()
+    return {"id": created.get("id"), "webViewLink": created.get("webViewLink")}
 
-    # (optional) cleanup local file
+async def post_callback(callback_url: str, payload: dict) -> None:
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            await client.post(callback_url, json=payload)
+    except Exception:
+        pass  # don't crash job on callback failure
+
+def run_job_sync(req: DownloadReq) -> Dict[str, str]:
+    # decide final name
+    if req.expected_name:
+        out_name = req.expected_name if req.expected_name.endswith(".mp4") else f"{req.expected_name}.mp4"
+    else:
+        vid = derive_id(req.url)
+        out_name = f"tate_{vid}_{slug(vid)}.mp4"
+
+    tmp_dir = os.environ.get("WORK_DIR", "/data")
+    tmp_path = os.path.join(tmp_dir, out_name)
+
+    # download
+    download_video(req.url, tmp_path)
+
+    # upload
+    drive_info = upload_to_drive(tmp_path, out_name, req.drive_parent)
+
+    # cleanup (optional)
     try:
         os.remove(tmp_path)
     except Exception:
         pass
 
-    return {"fileId": created.get("id"), "webViewLink": created.get("webViewLink")}
+    result = {
+        "status": "done",
+        "out_name": out_name,
+        "drive": drive_info,
+        "url": req.url,
+        "tag": req.tag or "",
+    }
+    return result
 
-# -------- Endpoint ----------
+async def run_job_background(req: DownloadReq):
+    try:
+        result = run_job_sync(req)
+        if req.callback_url:
+            await post_callback(req.callback_url, result)
+    except Exception as e:
+        if req.callback_url:
+            await post_callback(req.callback_url, {
+                "status": "error",
+                "url": req.url,
+                "tag": req.tag or "",
+                "error": str(e)
+            })
+
 @app.post("/download")
-def enqueue(req: DownloadReq):
+async def enqueue(req: DownloadReq, bg: BackgroundTasks):
     if not req.url or "rumble.com" not in req.url:
         raise HTTPException(status_code=400, detail="Provide a valid rumble.com URL")
 
-    # Decide final output name:
-    # 1) use expected_name if provided by n8n
-    # 2) else derive from URL id
-    def derive_id(u: str) -> str:
-        import re
-        m = re.search(r"/(v[0-9a-z]+)", u, re.I)
-        return m.group(1).lower() if m else "vid"
-
-    def slug(s: str, n: int = 15) -> str:
-        import re
-        sl = re.sub(r"[^A-Za-z0-9]+", "_", s.lower()).strip("_")
-        return sl[:n]
-
-    if req.expected_name:
-        out_name = req.expected_name
-        if not out_name.endswith(".mp4"):
-            out_name += ".mp4"
-    else:
-        vid = derive_id(req.url)
-        # You can optionally pull a title first; kept simple:
-        out_name = f"tate_{vid}_{slug(vid)}.mp4"
-
-    try:
-        result = run_download_and_upload(
-            url=req.url,
-            out_name=out_name,
-            drive_parent=req.drive_parent,
-        )
-        return {
-            "status": "queued",    # or "done" if you run synchronous like here
-            "out_name": out_name,
-            "drive": result
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    # Return immediately; run in background to avoid gateway timeouts
+    bg.add_task(run_job_background, req)
+    job_id = (req.tag or derive_id(req.url)) + "-" + str(int(asyncio.get_event_loop().time()*1000))
+    return {"status": "accepted", "job_id": job_id}
