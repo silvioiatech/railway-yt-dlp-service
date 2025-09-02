@@ -11,32 +11,43 @@ import threading
 from typing import Optional, Literal, List, Dict, Any
 from datetime import datetime
 
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Header
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Header, Query
 from fastapi.responses import JSONResponse, StreamingResponse
-from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 
 import httpx
 import uvicorn
 
-# ----------------------- Config -----------------------
+# =========================
+# Config
+# =========================
 APP_PORT = int(os.getenv("PORT", "8000"))
 
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").rstrip("/")
 PUBLIC_FILES_DIR = os.getenv("PUBLIC_FILES_DIR", "/data/public")
 os.makedirs(PUBLIC_FILES_DIR, exist_ok=True)
 
-ONCE_TOKEN_TTL_SEC = int(os.getenv("ONCE_TOKEN_TTL_SEC", "86400"))  # 24h default
-DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT_SEC") or 1800)   # 30m default
+ONCE_TOKEN_TTL_SEC = int(os.getenv("ONCE_TOKEN_TTL_SEC", "86400"))  # if never downloaded
+DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT_SEC") or 1800)   # default per job
 
-# Always allow any URL (hard-on)
+# Always allow any URL
 ALLOW_ANY_URL = True
 
-# In-memory single-use registry: token -> meta
+# =========================
+# In-memory registries
+# =========================
+# Single-use token registry: token -> meta
 # meta: { path, size, active, consumed, last_seen, expiry }
 ONCE_TOKENS: Dict[str, Dict[str, Any]] = {}
 
-# ----------------------- Utils -----------------------
+# Job status registry for polling: tag -> {status, payload}
+# status: queued | downloading | ready | error
+# payload (when ready): { tag, expected_name, once_url, expires_in_sec, quality }
+JOBS: Dict[str, Dict[str, Any]] = {}
+
+# =========================
+# Utils
+# =========================
 def sanitize_filename(name: str) -> str:
     safe = re.sub(r"[^a-zA-Z0-9._-]", "_", name)
     return safe.strip(" .")
@@ -62,9 +73,12 @@ async def safe_callback(url: str, payload: dict):
         async with httpx.AsyncClient(timeout=15) as client:
             await client.post(url, json=payload)
     except Exception:
+        # best-effort; ignore failures
         pass
 
-# ----------------------- Single-use URL helpers -----------------------
+# =========================
+# Single-use link helpers
+# =========================
 def _file_stat(path: str) -> tuple[int, str]:
     p = pathlib.Path(path)
     if not p.exists() or not p.is_file():
@@ -123,7 +137,9 @@ def _janitor_loop():
 
 threading.Thread(target=_janitor_loop, daemon=True).start()
 
-# ----------------------- API -----------------------
+# =========================
+# FastAPI app
+# =========================
 app = FastAPI()
 
 @app.get("/")
@@ -140,6 +156,9 @@ def root():
 def healthz():
     return {"ok": True}
 
+# =========================
+# Models
+# =========================
 class DownloadReq(BaseModel):
     url: str
     tag: Optional[str] = Field(default_factory=lambda: f"job_{uuid.uuid4().hex[:8]}")
@@ -154,16 +173,23 @@ class DownloadAck(BaseModel):
     expected_name: Optional[str]
     note: str
 
+# =========================
+# Routes
+# =========================
 @app.post("/download", response_model=DownloadAck)
 async def download(req: DownloadReq, bg: BackgroundTasks):
-    if not req.url:
+    if not req.url or not isinstance(req.url, str):
         raise HTTPException(status_code=400, detail="Missing url")
-    # Any URL allowed (hard-on). If you want to restrict, add checks here.
+
+    # Any URL allowed (hard-enabled). Add your own allow/deny if needed.
 
     expected = req.expected_name or f"{req.tag}.mp4"
     expected = sanitize_filename(expected)
     if not expected.lower().endswith(".mp4"):
         expected += ".mp4"
+
+    # Register job for polling
+    JOBS[req.tag] = {"status": "queued", "payload": None}
 
     bg.add_task(worker_job, req, expected)
     return DownloadAck(accepted=True, tag=req.tag, expected_name=expected, note="processing")
@@ -242,7 +268,25 @@ def serve_single_use(token: str, range_header: Optional[str] = Header(default=No
 
     return StreamingResponse(file_iter(), status_code=status_code, headers=headers)
 
-# ----------------------- Worker -----------------------
+@app.get("/status")
+def get_status(tag: str = Query(...)):
+    rec = JOBS.get(tag)
+    if not rec:
+        return JSONResponse({"tag": tag, "status": "unknown"}, status_code=404)
+    return {"tag": tag, "status": rec["status"]}
+
+@app.get("/result")
+def get_result(tag: str = Query(...)):
+    rec = JOBS.get(tag)
+    if not rec:
+        return JSONResponse({"tag": tag, "status": "unknown"}, status_code=404)
+    if rec["status"] != "ready" or not rec.get("payload"):
+        return JSONResponse({"tag": tag, "status": rec["status"]}, status_code=202)
+    return {"tag": tag, "status": "ready", **rec["payload"]}
+
+# =========================
+# Worker
+# =========================
 async def worker_job(req: DownloadReq, expected_name: str):
     started_iso = datetime.utcnow().isoformat()
     work_dir = tempfile.mkdtemp(prefix="dl_")
@@ -251,6 +295,8 @@ async def worker_job(req: DownloadReq, expected_name: str):
     public_path = os.path.join(PUBLIC_FILES_DIR, expected_name)
 
     try:
+        JOBS[req.tag]["status"] = "downloading"
+
         # Build yt-dlp command by quality
         base_cmd = ["yt-dlp", "--no-warnings", "--newline", "--force-ipv4", "-o", temp_tpl, req.url]
         if req.quality == "BEST_ORIGINAL":
@@ -262,6 +308,7 @@ async def worker_job(req: DownloadReq, expected_name: str):
 
         rc, so, se = await run(cmd, timeout=req.timeout or DOWNLOAD_TIMEOUT)
         if rc != 0:
+            JOBS[req.tag] = {"status": "error", "payload": {"message": f"yt-dlp failed (rc={rc})"}}
             await safe_callback(req.callback_url or "", {
                 "status": "error",
                 "tag": req.tag,
@@ -278,6 +325,7 @@ async def worker_job(req: DownloadReq, expected_name: str):
         ]
         files = [f for f in files if re.search(r"\.(mp4|mkv|webm|m4a|mov|mp3)$", f, re.I)]
         if not files:
+            JOBS[req.tag] = {"status": "error", "payload": {"message": "Downloaded file not found"}}
             await safe_callback(req.callback_url or "", {
                 "status": "error", "tag": req.tag, "message": "Downloaded file not found",
                 "started_at": started_iso, "completed_at": datetime.utcnow().isoformat()
@@ -297,6 +345,7 @@ async def worker_job(req: DownloadReq, expected_name: str):
                     timeout=max(1800, req.timeout or DOWNLOAD_TIMEOUT)
                 )
                 if rc3 != 0:
+                    JOBS[req.tag] = {"status": "error", "payload": {"message": "ffmpeg failed"}}
                     await safe_callback(req.callback_url or "", {
                         "status": "error", "tag": req.tag, "message": "ffmpeg failed",
                         "started_at": started_iso, "completed_at": datetime.utcnow().isoformat()
@@ -308,55 +357,29 @@ async def worker_job(req: DownloadReq, expected_name: str):
         # Move into public dir (persistent volume)
         shutil.move(out_local, public_path)
 
-        # Best-effort metadata
-        meta = {}
-        try:
-            rc_meta, so_meta, se_meta = await run(
-                ["yt-dlp", "--dump-json", "--no-warnings", "--force-ipv4", req.url],
-                timeout=90
-            )
-            if rc_meta == 0:
-                line = next((ln for ln in so_meta.splitlines() if ln.strip().startswith("{")), "{}")
-                m = json.loads(line)
-                rumble_count = m.get("rumble_count")
-                meta = {
-                    "id": m.get("id"),
-                    "title": m.get("title"),
-                    "url": m.get("webpage_url") or m.get("url"),
-                    "uploader": m.get("uploader") or m.get("channel"),
-                    "channel": m.get("channel") or m.get("uploader"),
-                    "channel_id": m.get("channel_id") or m.get("uploader_id"),
-                    "extractor": m.get("extractor"),
-                    "upload_date": m.get("upload_date"),
-                    "duration": m.get("duration"),
-                    "view_count": m.get("view_count"),
-                    "like_count": m.get("like_count") or rumble_count,
-                    "dislike_count": m.get("dislike_count"),
-                    "comment_count": m.get("comment_count"),
-                    "rumbles": rumble_count,
-                    "thumbnail": m.get("thumbnail"),
-                }
-        except Exception:
-            pass
-
         # Build single-use URL (auto-deletes after first full transfer)
         once_url = make_single_use_url(os.path.basename(public_path), base_url=PUBLIC_BASE_URL)
 
-        # Respond / callback
-        payload = {
-            "status": "ready",
+        # Record payload for polling
+        ready_payload = {
             "tag": req.tag,
-            "expected_name": os.path.basename(public_path),
+            "expected_name": expected_name,
             "once_url": once_url,
             "expires_in_sec": ONCE_TOKEN_TTL_SEC,
             "quality": req.quality,
-            "metadata": meta,
+        }
+        JOBS[req.tag] = {"status": "ready", "payload": ready_payload}
+
+        # Optional: still try to callback if provided
+        await safe_callback(req.callback_url or "", {
+            "status": "ready",
+            **ready_payload,
             "started_at": started_iso,
             "completed_at": datetime.utcnow().isoformat()
-        }
-        await safe_callback(req.callback_url or "", payload)
+        })
 
     except Exception as e:
+        JOBS[req.tag] = {"status": "error", "payload": {"message": str(e)}}
         await safe_callback(req.callback_url or "", {
             "status": "error",
             "tag": req.tag,
@@ -370,6 +393,8 @@ async def worker_job(req: DownloadReq, expected_name: str):
         except Exception:
             pass
 
-# ----------------------- main -----------------------
+# =========================
+# Main
+# =========================
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=APP_PORT, reload=False)
