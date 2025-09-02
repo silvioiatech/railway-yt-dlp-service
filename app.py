@@ -11,14 +11,13 @@ from io import StringIO
 from typing import Optional, Literal, List, Dict
 from datetime import datetime, timedelta
 
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Query, Body
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Query
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 import httpx
 import uvicorn
 
-# Google Drive
 from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -27,44 +26,35 @@ from googleapiclient.http import MediaFileUpload
 from asyncio import Semaphore, wait_for, TimeoutError as AsyncTimeout
 from threading import Lock
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Config
-# ──────────────────────────────────────────────────────────────────────────────
+# ----------------------- Config -----------------------
 APP_PORT = int(os.getenv("PORT", "8000"))
-
-# Drive auth mode: "oauth" uses user refresh token, "service" uses service account
 AUTH_MODE = (os.getenv("DRIVE_AUTH") or "oauth").lower()  # "oauth" | "service"
 
 DEFAULT_DRIVE_FOLDER_ID = (os.getenv("DRIVE_FOLDER_ID") or "").strip() or None
 DRIVE_PUBLIC = (os.getenv("DRIVE_PUBLIC") or "false").lower() == "true"
 DELETE_LOCAL_AFTER_UPLOAD = (os.getenv("DELETE_LOCAL_AFTER_UPLOAD") or "true").lower() == "true"
 
-# yt-dlp Process Defaults
-DISCOVER_TIMEOUT = int(os.getenv("DISCOVER_TIMEOUT_SEC") or 180)
-DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT_SEC") or 1800)
+DISCOVER_TIMEOUT = int(os.getenv("DISCOVER_TIMEOUT_SEC") or 180)        # sync
+DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT_SEC") or 1800)       # download worker
 
-# Enriched default fields ALWAYS returned by /discover (unless explicitly overridden)
+# Async discover defaults (server-controlled)
+DISCOVER_FAST_DEFAULT = (os.getenv("DISCOVER_FAST_DEFAULT") or "true").lower() == "true"
+DISCOVER_CONCURRENCY_DEFAULT = int(os.getenv("DISCOVER_CONCURRENCY_DEFAULT") or 6)
+DISCOVER_PER_ITEM_TIMEOUT_DEFAULT = int(os.getenv("DISCOVER_PER_ITEM_TIMEOUT_DEFAULT") or 20)
+DISCOVER_TIMEOUT_DEFAULT = int(os.getenv("DISCOVER_TIMEOUT_DEFAULT") or 120)
+
 DEFAULT_DISCOVER_FIELDS = (
     "id,title,url,uploader,channel,channel_id,extractor,"
     "upload_date,duration,view_count,like_count,dislike_count,comment_count,rumbles,"
     "thumbnail"
 )
 
-# Async jobs storage (in-memory)
 JOB_STORE: Dict[str, dict] = {}
 JOB_LOCK = Lock()
-JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_SECONDS") or 3600)  # keep results for 1 hour
+JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_SECONDS") or 3600)
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Drive client
-# ──────────────────────────────────────────────────────────────────────────────
+# ----------------------- Drive -----------------------
 def build_drive_service():
-    """
-    Build a Google Drive service either via OAuth (refresh token) or Service Account.
-    Service Account requires Shared Drives or domain delegation to have storage quota.
-    """
     if AUTH_MODE == "oauth":
         client_id = os.getenv("GOOGLE_CLIENT_ID")
         client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
@@ -82,7 +72,6 @@ def build_drive_service():
         )
         return build("drive", "v3", credentials=creds, cache_discovery=False)
 
-    # Service account (Workspace shared drive or domain-delegated)
     service_json = os.getenv("DRIVE_SERVICE_ACCOUNT_JSON")
     if not service_json and os.getenv("DRIVE_SERVICE_ACCOUNT_JSON_B64"):
         service_json = base64.b64decode(os.getenv("DRIVE_SERVICE_ACCOUNT_JSON_B64")).decode("utf-8")
@@ -91,16 +80,11 @@ def build_drive_service():
     creds_info = json.loads(service_json)
     scopes = ["https://www.googleapis.com/auth/drive"]
     sa = service_account.Credentials.from_service_account_info(creds_info, scopes=scopes)
-    # NOTE: if you need domain-wide delegation, use sa.with_subject("user@domain.com")
     return build("drive", "v3", credentials=sa, cache_discovery=False)
-
 
 drive_service = build_drive_service()
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# ----------------------- Utils -----------------------
 def sanitize_filename(name: str) -> str:
     safe = re.sub(r"[^a-zA-Z0-9._-]", "_", name)
     return safe.strip(" .")
@@ -120,15 +104,13 @@ async def run(cmd: List[str], timeout: Optional[int] = None) -> tuple[int, str, 
     return proc.returncode, stdout.decode(errors="ignore"), stderr.decode(errors="ignore")
 
 def upload_to_drive(local_path: str, out_name: str, folder_id: Optional[str]) -> dict:
-    file_metadata = {"name": out_name}
+    meta = {"name": out_name}
     if folder_id:
-        file_metadata["parents"] = [folder_id]
+        meta["parents"] = [folder_id]
     media = MediaFileUpload(local_path, resumable=True)
-    file = (
-        drive_service.files()
-        .create(body=file_metadata, media_body=media, fields="id, webViewLink", supportsAllDrives=True)
-        .execute()
-    )
+    file = drive_service.files().create(
+        body=meta, media_body=media, fields="id, webViewLink", supportsAllDrives=True
+    ).execute()
     if DRIVE_PUBLIC:
         drive_service.permissions().create(
             fileId=file["id"], body={"role": "reader", "type": "anyone"}, supportsAllDrives=True
@@ -142,18 +124,10 @@ async def safe_callback(url: str, payload: dict):
         async with httpx.AsyncClient(timeout=15) as client:
             await client.post(url, json=payload)
     except Exception:
-        # Swallow callback errors to not break the worker
         pass
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# yt-dlp helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# ----------------------- yt-dlp helpers -----------------------
 def normalize_entry(e: dict) -> dict:
-    """
-    Normalize a yt-dlp entry across platforms.
-    Exposes as many useful metrics as available (likes, rumbles, dislikes, comments).
-    """
     rumble_count = e.get("rumble_count")
     like_count = e.get("like_count") or rumble_count
     return {
@@ -164,13 +138,13 @@ def normalize_entry(e: dict) -> dict:
         "channel": e.get("channel") or e.get("uploader") or "",
         "channel_id": e.get("channel_id") or e.get("uploader_id") or "",
         "extractor": e.get("extractor") or "",
-        "upload_date": e.get("upload_date"),  # YYYYMMDD
+        "upload_date": e.get("upload_date"),
         "duration": e.get("duration"),
         "view_count": e.get("view_count"),
-        "like_count": like_count,                   # YouTube/Rumble mapped
-        "dislike_count": e.get("dislike_count"),    # rarely available
+        "like_count": like_count,
+        "dislike_count": e.get("dislike_count"),
         "comment_count": e.get("comment_count"),
-        "rumbles": rumble_count,                    # explicit rumble metric
+        "rumbles": rumble_count,
         "thumbnail": e.get("thumbnail") or "",
     }
 
@@ -186,23 +160,14 @@ def to_ndjson(rows: List[dict]) -> str:
     return "\n".join(json.dumps(r, ensure_ascii=False) for r in rows)
 
 async def ytdlp_playlist_json(source_url: str, extra_args: Optional[List[str]] = None, timeout: int = 180) -> dict:
-    """
-    Robust wrapper around `yt-dlp -J` that:
-      - tries the given URL
-      - if it's a Rumble channel (/c/NAME), retries with /videos and with API hint
-      - adds compatibility flags to reduce extractor/CDN issues
-    """
     base = ["yt-dlp", "-J", "--no-warnings", "--ignore-errors", "--force-ipv4"]
     args = base + (extra_args or []) + [source_url]
-
     rc, so, se = await run(args, timeout=timeout)
     if rc == 0:
         try:
             return json.loads(so)
         except Exception:
-            pass  # fall through to retries
-
-    # RUMBLE FALLBACKS
+            pass
     if "rumble.com" in source_url and "/c/" in source_url:
         alt = source_url.rstrip("/") + "/videos"
         args_alt = base + (extra_args or []) + [alt]
@@ -212,27 +177,17 @@ async def ytdlp_playlist_json(source_url: str, extra_args: Optional[List[str]] =
                 return json.loads(so2)
             except Exception:
                 pass
-
-        # Best-effort extractor hint (ignored if unsupported)
-        args_alt2 = base + (extra_args or []) + [
-            "--extractor-args", "rumble:use_api=1"
-        ] + [alt]
+        args_alt2 = base + (extra_args or []) + ["--extractor-args", "rumble:use_api=1"] + [alt]
         rc3, so3, se3 = await run(args_alt2, timeout=timeout)
         if rc3 == 0:
             try:
                 return json.loads(so3)
             except Exception:
                 pass
-
         raise RuntimeError(f"yt-dlp -J failed for Rumble channel. stderr={se3 or se2 or se}")
-
-    # Non-Rumble: return the stderr snippet for debugging
     raise RuntimeError(f"yt-dlp -J failed (rc={rc}). stderr={se[-500:]}")
 
 async def ytdlp_flat_entries(source_url: str, extra_args: Optional[List[str]] = None, timeout: int = 120) -> List[str]:
-    """
-    Use --flat-playlist to get entry URLs quickly, then we can fetch each entry's metadata separately.
-    """
     base = ["yt-dlp", "-J", "--flat-playlist", "--no-warnings", "--ignore-errors", "--force-ipv4"]
     args = base + (extra_args or []) + [source_url]
     rc, so, se = await run(args, timeout=timeout)
@@ -248,9 +203,6 @@ async def ytdlp_flat_entries(source_url: str, extra_args: Optional[List[str]] = 
     return urls
 
 async def ytdlp_dump_json(entry_url: str, extra_args: Optional[List[str]] = None, timeout: int = 30) -> Optional[dict]:
-    """
-    Dump a single entry's JSON (fast). Returns None on non-fatal failure.
-    """
     base = ["yt-dlp", "--dump-json", "--no-warnings", "--ignore-errors", "--force-ipv4"]
     args = base + (extra_args or []) + [entry_url]
     rc, so, se = await run(args, timeout=timeout)
@@ -260,20 +212,14 @@ async def ytdlp_dump_json(entry_url: str, extra_args: Optional[List[str]] = None
     return json.loads(line) if line else None
 
 async def gather_limited(coros, limit: int, overall_timeout: int) -> List[Optional[dict]]:
-    """
-    Run coroutines with a concurrency limit and an overall deadline.
-    """
     sem = Semaphore(max(1, limit))
-
     async def run_one(coro_factory):
         async with sem:
             return await coro_factory()
-
     tasks = [run_one(cf) for cf in coros]
     try:
         return await wait_for(asyncio.gather(*tasks, return_exceptions=False), timeout=overall_timeout)
     except AsyncTimeout:
-        # Return only results from tasks that finished
         done = []
         for t in tasks:
             if hasattr(t, 'done') and t.done() and not t.cancelled():
@@ -283,10 +229,7 @@ async def gather_limited(coros, limit: int, overall_timeout: int) -> List[Option
                     done.append(None)
         return done
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# FastAPI models
-# ──────────────────────────────────────────────────────────────────────────────
+# ----------------------- Models -----------------------
 class DownloadReq(BaseModel):
     url: str
     tag: Optional[str] = Field(default_factory=lambda: f"job_{uuid.uuid4().hex[:8]}")
@@ -312,34 +255,27 @@ class DiscoverAsyncReq(BaseModel):
     match_filter: str = ""
     format: Literal["json", "csv", "ndjson"] = "json"
     fields: str = ""
-    timeout: int = DISCOVER_TIMEOUT
-    fast: bool = False
-    concurrency: int = 6
-    per_item_timeout: int = 25
-    debug: bool = False
+    # knobs optional: server defaults will be used if omitted
+    timeout: Optional[int] = None
+    fast: Optional[bool] = None
+    concurrency: Optional[int] = None
+    per_item_timeout: Optional[int] = None
+    debug: Optional[bool] = None
     callback_url: Optional[str] = None
     filename_hint: Optional[str] = None
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# FastAPI app
-# ──────────────────────────────────────────────────────────────────────────────
+# ----------------------- App -----------------------
 app = FastAPI()
-
 
 @app.get("/")
 def root():
     return {"status": "ok", "auth_mode": AUTH_MODE, "time": datetime.utcnow().isoformat()}
 
-
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Core discover engine (re-usable by sync + async endpoints)
-# ──────────────────────────────────────────────────────────────────────────────
+# ----------------------- Core discover engine -----------------------
 async def run_discover_engine(
     sources: str,
     limit: int,
@@ -358,7 +294,6 @@ async def run_discover_engine(
     if not src_list:
         raise HTTPException(status_code=400, detail="No sources provided")
 
-    # Build filters
     extra_args: List[str] = []
     if match_filter:
         extra_args += ["--match-filter", match_filter]
@@ -371,42 +306,32 @@ async def run_discover_engine(
             extra_args += ["--match-filter", " & ".join(clauses)]
     if dateafter:
         extra_args += ["--dateafter", dateafter]
-    extra_args += ["--ignore-errors"]  # tolerate hiccups
+    extra_args += ["--ignore-errors"]
 
     rows: List[Dict] = []
-
-    # Overall deadline for the whole endpoint
     loop = asyncio.get_event_loop()
     deadline = loop.time() + timeout
-
     async def time_left():
         return max(1, int(deadline - loop.time()))
 
     for src in src_list:
-        # Normalize Rumble channel to /videos (more reliable)
         if re.search(r"https?://(?:www\.)?rumble\.com/c/[^/]+/?$", src, re.I):
             src = src.rstrip("/") + "/videos"
-
         try:
             if fast:
-                # 1) Get a flat list of entry URLs quickly
                 flat_urls = await ytdlp_flat_entries(src, extra_args=extra_args, timeout=min(120, await time_left()))
                 if not flat_urls:
                     raise RuntimeError("No entries (flat)")
-                # 2) Trim to limit early
                 flat_urls = flat_urls[:limit]
-                # 3) Build coroutine factories for concurrent per-entry dump-json
                 def make_coro(u):
                     async def _c():
                         return await ytdlp_dump_json(u, extra_args=extra_args, timeout=min(per_item_timeout, await time_left()))
                     return _c
                 coros = [make_coro(u) for u in flat_urls]
                 metas = await gather_limited(coros, limit=concurrency, overall_timeout=await time_left())
-                # 4) Normalize each successful meta
                 for m in metas:
                     if isinstance(m, dict):
                         rows.append(normalize_entry(m))
-                # If nothing succeeded, fall back to monolithic -J (single try within remaining time)
                 if not rows:
                     data = await ytdlp_playlist_json(src, extra_args=extra_args, timeout=min(120, await time_left()))
                     entries = data.get("entries")
@@ -417,7 +342,6 @@ async def run_discover_engine(
                     else:
                         rows.append(normalize_entry(data))
             else:
-                # Original path (monolithic -J)
                 data = await ytdlp_playlist_json(src, extra_args=extra_args, timeout=min(240, await time_left()))
                 entries = data.get("entries")
                 if isinstance(entries, list) and entries:
@@ -426,7 +350,6 @@ async def run_discover_engine(
                             rows.append(normalize_entry(e))
                 else:
                     rows.append(normalize_entry(data))
-
         except Exception as e:
             err = {"error": str(e)[:500]} if debug else {}
             rows.append({
@@ -436,10 +359,7 @@ async def run_discover_engine(
                 "like_count": None, "dislike_count": None, "comment_count": None,
                 "rumbles": None, "thumbnail": "", **err
             })
-            # continue to next source
-
     return rows
-
 
 def pick_fields(items: List[Dict], fields: str) -> (List[str], List[Dict]):
     raw_fields = (fields or "").strip()
@@ -449,86 +369,109 @@ def pick_fields(items: List[Dict], fields: str) -> (List[str], List[Dict]):
     projected = [{k: r.get(k) for k in field_list} for r in items]
     return field_list, projected
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# /discover — synchronous (kept for simple cases)
-# ──────────────────────────────────────────────────────────────────────────────
+# ----------------------- /discover (sync) -----------------------
 @app.get("/discover")
 async def discover(
-    sources: str = Query(..., description="Comma-separated channel/playlist/video URLs (any yt-dlp site)"),
-    limit: int = Query(100, ge=1, le=1000, description="Max items per source"),
-    min_views: int = Query(0, ge=0, description="view_count >= this"),
-    min_duration: int = Query(0, ge=0, description="duration >= this (sec)"),
-    max_duration: int = Query(0, ge=0, description="duration <= this (sec)"),
-    dateafter: str = Query("", description='yt-dlp --dateafter (e.g. "now-30days", "20240101")'),
-    match_filter: str = Query("", description='raw yt-dlp --match-filter (overrides simple knobs)'),
+    sources: str = Query(...),
+    limit: int = Query(100, ge=1, le=1000),
+    min_views: int = Query(0, ge=0),
+    min_duration: int = Query(0, ge=0),
+    max_duration: int = Query(0, ge=0),
+    dateafter: str = Query(""),
+    match_filter: str = Query(""),
     format: str = Query("json", pattern="^(json|ndjson|csv)$"),
-    fields: str = Query(DEFAULT_DISCOVER_FIELDS, description='Comma-separated fields ("*" or empty = defaults)'),
-    timeout: int = Query(DISCOVER_TIMEOUT, ge=10, le=3600, description="Overall server-side time budget (seconds)"),
-    fast: bool = Query(False, description="Enable flat listing + concurrent per-entry fetches"),
-    concurrency: int = Query(6, ge=1, le=20, description="Max concurrent entry fetches when fast=1"),
-    per_item_timeout: int = Query(25, ge=5, le=120, description="Per-entry dump-json timeout when fast=1"),
-    debug: bool = Query(False, description="Include extractor errors in rows"),
+    fields: str = Query(DEFAULT_DISCOVER_FIELDS),
+    timeout: int = Query(DISCOVER_TIMEOUT, ge=10, le=3600),
+    fast: bool = Query(False),
+    concurrency: int = Query(6, ge=1, le=20),
+    per_item_timeout: int = Query(25, ge=5, le=120),
+    debug: bool = Query(False),
 ):
     rows = await run_discover_engine(
-        sources=sources, limit=limit, min_views=min_views,
-        min_duration=min_duration, max_duration=max_duration,
-        dateafter=dateafter, match_filter=match_filter,
-        timeout=timeout, fast=fast, concurrency=concurrency,
-        per_item_timeout=per_item_timeout, debug=debug
+        sources, limit, min_views, min_duration, max_duration,
+        dateafter, match_filter, timeout, fast, concurrency, per_item_timeout, debug
     )
     field_list, items = pick_fields(rows, fields)
-
     if format == "csv":
-        csv_text = to_csv(items, field_list)
-        return PlainTextResponse(csv_text, media_type="text/csv; charset=utf-8")
-    elif format == "ndjson":
-        ndjson_text = to_ndjson(items)
-        return PlainTextResponse(ndjson_text, media_type="application/x-ndjson; charset=utf-8")
-    else:
-        return JSONResponse({
-            "count": len(items),
-            "fetched_at": datetime.utcnow().isoformat(),
-            "sources": [s.strip() for s in sources.split(",") if s.strip()],
-            "fields": field_list,
-            "items": items,
-        })
+        return PlainTextResponse(to_csv(items, field_list), media_type="text/csv; charset=utf-8")
+    if format == "ndjson":
+        return PlainTextResponse(to_ndjson(items), media_type="application/x-ndjson; charset=utf-8")
+    return JSONResponse({
+        "count": len(items),
+        "fetched_at": datetime.utcnow().isoformat(),
+        "sources": [s.strip() for s in sources.split(",") if s.strip()],
+        "fields": field_list,
+        "items": items,
+    })
 
+# ----------------------- Async job API -----------------------
+class DiscoverAsyncReq(BaseModel):
+    sources: str
+    limit: int = 100
+    min_views: int = 0
+    min_duration: int = 0
+    max_duration: int = 0
+    dateafter: str = ""
+    match_filter: str = ""
+    format: Literal["json", "csv", "ndjson"] = "json"
+    fields: str = ""
+    timeout: Optional[int] = None
+    fast: Optional[bool] = None
+    concurrency: Optional[int] = None
+    per_item_timeout: Optional[int] = None
+    debug: Optional[bool] = None
+    callback_url: Optional[str] = None
+    filename_hint: Optional[str] = None
 
-# ──────────────────────────────────────────────────────────────────────────────
-# /discover_async — queue a job and return immediately
-# ──────────────────────────────────────────────────────────────────────────────
 @app.post("/discover_async")
 async def discover_async(req: DiscoverAsyncReq, bg: BackgroundTasks):
+    # resolve server-side defaults (ignore/override missing values)
+    timeout = req.timeout if (req.timeout and req.timeout > 0) else DISCOVER_TIMEOUT_DEFAULT
+    fast = DISCOVER_FAST_DEFAULT if req.fast is None else bool(req.fast)
+    concurrency = req.concurrency or DISCOVER_CONCURRENCY_DEFAULT
+    per_item_timeout = req.per_item_timeout or DISCOVER_PER_ITEM_TIMEOUT_DEFAULT
+    debug = bool(req.debug) if req.debug is not None else False
+
     job_id = f"djob_{uuid.uuid4().hex[:10]}"
     now = datetime.utcnow().isoformat()
-
     with JOB_LOCK:
         JOB_STORE[job_id] = {
             "status": "queued",
             "created_at": now,
             "updated_at": now,
-            "req": req.dict(),
-            "format": req.format,
-            "fields": req.fields,
+            "req": {
+                "sources": req.sources,
+                "limit": req.limit,
+                "min_views": req.min_views,
+                "min_duration": req.min_duration,
+                "max_duration": req.max_duration,
+                "dateafter": req.dateafter,
+                "match_filter": req.match_filter,
+                "format": req.format,
+                "fields": req.fields,
+                "timeout": timeout,
+                "fast": fast,
+                "concurrency": concurrency,
+                "per_item_timeout": per_item_timeout,
+                "debug": debug,
+                "callback_url": req.callback_url,
+                "filename_hint": req.filename_hint,
+            },
             "result": None,
             "error": None,
             "expires_at": (datetime.utcnow() + timedelta(seconds=JOB_TTL_SECONDS)).isoformat()
         }
-
     bg.add_task(_discover_worker, job_id)
     return {"job_id": job_id, "status": "queued"}
-
 
 async def _discover_worker(job_id: str):
     with JOB_LOCK:
         rec = JOB_STORE.get(job_id)
-        if not rec:
-            return
+        if not rec: return
         rec["status"] = "running"
         rec["updated_at"] = datetime.utcnow().isoformat()
 
-    req: Dict = rec["req"]
+    req = rec["req"]
     try:
         rows = await run_discover_engine(
             sources=req["sources"], limit=req["limit"], min_views=req["min_views"],
@@ -537,7 +480,6 @@ async def _discover_worker(job_id: str):
             timeout=req["timeout"], fast=req["fast"], concurrency=req["concurrency"],
             per_item_timeout=req["per_item_timeout"], debug=req["debug"]
         )
-        # Save raw rows; formatting is done at GET /discover_result time
         with JOB_LOCK:
             rec = JOB_STORE.get(job_id)
             if rec:
@@ -552,41 +494,34 @@ async def _discover_worker(job_id: str):
                 rec["error"] = str(e)
                 rec["updated_at"] = datetime.utcnow().isoformat()
 
-    # optional callback
+    cb = None
     with JOB_LOCK:
         rec = JOB_STORE.get(job_id)
-        cb = rec["req"].get("callback_url") if rec else None
-        status = rec["status"] if rec else "unknown"
+        if rec:
+            cb = rec["req"].get("callback_url")
+            status = rec["status"]
     if cb:
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 await client.post(cb, json={"job_id": job_id, "status": status})
         except Exception:
             pass
-
-    # Garbage collect expired jobs
     _gc_jobs()
-
 
 def _gc_jobs():
     now = datetime.utcnow()
-    to_delete = []
+    exp = []
     with JOB_LOCK:
         for jid, rec in JOB_STORE.items():
             try:
-                exp = datetime.fromisoformat(rec.get("expires_at", "1970-01-01T00:00:00"))
+                t = datetime.fromisoformat(rec.get("expires_at", "1970-01-01T00:00:00"))
             except Exception:
-                exp = now
-            if now > exp:
-                to_delete.append(jid)
-        for jid in to_delete:
+                t = now
+            if now > t:
+                exp.append(jid)
+        for jid in exp:
             del JOB_STORE[jid]
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# /discover_status — check job state
-# /discover_result — fetch final data (json/csv/ndjson)
-# ──────────────────────────────────────────────────────────────────────────────
 @app.get("/discover_status")
 async def discover_status(job_id: str = Query(...)):
     with JOB_LOCK:
@@ -595,13 +530,12 @@ async def discover_status(job_id: str = Query(...)):
             raise HTTPException(status_code=404, detail="job_id not found")
         return {"job_id": job_id, "status": rec["status"], "updated_at": rec["updated_at"]}
 
-
 @app.get("/discover_result")
 async def discover_result(
     job_id: str = Query(...),
     format: str = Query("json", pattern="^(json|ndjson|csv)$"),
     fields: str = Query("", description='Fields to output (empty or "*" = defaults)'),
-    filename_hint: str = Query("discover", description="Filename hint (no spaces, will be sanitized)"),
+    filename_hint: str = Query("discover", description="Filename hint"),
 ):
     with JOB_LOCK:
         rec = JOB_STORE.get(job_id)
@@ -611,47 +545,53 @@ async def discover_result(
         rows = rec["result"]
         err = rec["error"]
 
-    if status == "queued" or status == "running":
+    if status in ("queued", "running"):
         return JSONResponse({"job_id": job_id, "status": status}, status_code=202)
     if status == "error":
         raise HTTPException(status_code=500, detail=err or "Unknown error")
 
-    # done
     field_list, items = pick_fields(rows, fields or "")
-
-    # filename
     hint = sanitize_filename(filename_hint.lower().replace(" ", "_"))[:40] or "discover"
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     ext = "ndjson" if format == "ndjson" else format
     filename = f"discover_{hint}_{ts}.{ext}"
 
     if format == "csv":
-        csv_text = to_csv(items, field_list)
         return PlainTextResponse(
-            csv_text,
+            to_csv(items, field_list),
             media_type="text/csv; charset=utf-8",
             headers={"Content-Disposition": f'attachment; filename="{filename}"'}
         )
-    elif format == "ndjson":
-        ndjson_text = to_ndjson(items)
+    if format == "ndjson":
         return PlainTextResponse(
-            ndjson_text,
+            to_ndjson(items),
             media_type="application/x-ndjson; charset=utf-8",
             headers={"Content-Disposition": f'attachment; filename="{filename}"'}
         )
-    else:
-        return JSONResponse({
-            "job_id": job_id,
-            "count": len(items),
-            "fetched_at": datetime.utcnow().isoformat(),
-            "fields": field_list,
-            "items": items,
-        })
+    return JSONResponse({
+        "job_id": job_id,
+        "count": len(items),
+        "fetched_at": datetime.utcnow().isoformat(),
+        "fields": field_list,
+        "items": items,
+    })
 
+# ----------------------- /download -----------------------
+class DownloadReq(BaseModel):
+    url: str
+    tag: Optional[str] = Field(default_factory=lambda: f"job_{uuid.uuid4().hex[:8]}")
+    drive_folder: Optional[str] = None
+    expected_name: Optional[str] = None
+    callback_url: Optional[str] = None
+    quality: Literal["BEST_ORIGINAL", "BEST_MP4", "STRICT_MP4_REENC"] = "BEST_MP4"
+    timeout: Optional[int] = DOWNLOAD_TIMEOUT
 
-# ──────────────────────────────────────────────────────────────────────────────
-# /download — Rumble → mp4 → Drive upload (+callback with metadata)
-# ──────────────────────────────────────────────────────────────────────────────
+class DownloadAck(BaseModel):
+    accepted: bool
+    tag: str
+    expected_name: Optional[str]
+    note: str
+
 @app.post("/download", response_model=DownloadAck)
 async def download(req: DownloadReq, bg: BackgroundTasks):
     if not req.url or "rumble.com" not in req.url.lower():
@@ -660,12 +600,11 @@ async def download(req: DownloadReq, bg: BackgroundTasks):
     expected = sanitize_filename(expected)
     if not expected.lower().endswith(".mp4"):
         expected += ".mp4"
-    target_folder = req.drive_folder or DEFAULT_DRIVE_FOLDER_ID
-    if not target_folder:
-        raise HTTPException(status_code=400, detail="No Drive folder provided (drive_folder) and no default DRIVE_FOLDER_ID is set")
-    bg.add_task(worker_job, req, expected, target_folder)
+    folder_id = req.drive_folder or DEFAULT_DRIVE_FOLDER_ID
+    if not folder_id:
+        raise HTTPException(status_code=400, detail="No Drive folder provided and no default DRIVE_FOLDER_ID")
+    bg.add_task(worker_job, req, expected, folder_id)
     return DownloadAck(accepted=True, tag=req.tag, expected_name=expected, note="processing")
-
 
 async def worker_job(req: DownloadReq, expected_name: str, folder_id: str):
     started_iso = datetime.utcnow().isoformat()
@@ -675,14 +614,11 @@ async def worker_job(req: DownloadReq, expected_name: str, folder_id: str):
     try:
         base_cmd = ["yt-dlp", "--no-warnings", "--newline", "--force-ipv4", "-o", temp_tpl, req.url]
         if req.quality == "BEST_ORIGINAL":
-            fmt = "bestvideo*+bestaudio/best"
-            cmd = base_cmd + ["-f", fmt, "--merge-output-format", "mp4"]
+            cmd = base_cmd + ["-f", "bestvideo*+bestaudio/best", "--merge-output-format", "mp4"]
         elif req.quality == "BEST_MP4":
-            fmt = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b"
-            cmd = base_cmd + ["-f", fmt, "--remux-video", "mp4"]
+            cmd = base_cmd + ["-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b", "--remux-video", "mp4"]
         else:
-            fmt = "bv*+ba/best"
-            cmd = base_cmd + ["-f", fmt, "--recode-video", "mp4"]
+            cmd = base_cmd + ["-f", "bv*+ba/best", "--recode-video", "mp4"]
 
         rc, so, se = await run(cmd, timeout=req.timeout or DOWNLOAD_TIMEOUT)
         if rc != 0:
@@ -694,7 +630,6 @@ async def worker_job(req: DownloadReq, expected_name: str, folder_id: str):
             })
             return
 
-        # Find the downloaded media
         files = [
             f for f in os.listdir(work_dir)
             if os.path.isfile(os.path.join(work_dir, f)) and not f.endswith(".part")
@@ -709,9 +644,7 @@ async def worker_job(req: DownloadReq, expected_name: str, folder_id: str):
         files.sort(key=lambda f: os.path.getmtime(os.path.join(work_dir, f)), reverse=True)
         dl_path = os.path.join(work_dir, files[0])
 
-        # Ensure MP4
         if not dl_path.lower().endswith(".mp4") and expected_name.lower().endswith(".mp4"):
-            # Try stream copy first, then fallback to re-encode
             rc2, _, _ = await run(["ffmpeg", "-y", "-i", dl_path, "-c", "copy", out_local], timeout=600)
             if rc2 != 0:
                 rc3, _, _ = await run(
@@ -727,10 +660,8 @@ async def worker_job(req: DownloadReq, expected_name: str, folder_id: str):
         else:
             shutil.move(dl_path, out_local)
 
-        # Upload to Drive
         up = upload_to_drive(out_local, expected_name, folder_id)
 
-        # Enriched metadata (best-effort)
         meta = {}
         try:
             rc_meta, so_meta, se_meta = await run(["yt-dlp", "--dump-json", "--no-warnings", "--force-ipv4", req.url], timeout=90)
@@ -790,7 +721,6 @@ async def worker_job(req: DownloadReq, expected_name: str, folder_id: str):
         except Exception:
             pass
 
-
-# ──────────────────────────────────────────────────────────────────────────────
+# ----------------------- main -----------------------
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=APP_PORT, reload=False)
