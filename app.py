@@ -7,12 +7,11 @@ import base64
 import shutil
 import tempfile
 import uuid
-import itertools
 from io import StringIO
 from typing import Optional, Literal, List, Dict
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Query
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Query, Body
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
@@ -26,6 +25,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 from asyncio import Semaphore, wait_for, TimeoutError as AsyncTimeout
+from threading import Lock
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -50,6 +50,11 @@ DEFAULT_DISCOVER_FIELDS = (
     "upload_date,duration,view_count,like_count,dislike_count,comment_count,rumbles,"
     "thumbnail"
 )
+
+# Async jobs storage (in-memory)
+JOB_STORE: Dict[str, dict] = {}
+JOB_LOCK = Lock()
+JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_SECONDS") or 3600)  # keep results for 1 hour
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -297,6 +302,24 @@ class DownloadAck(BaseModel):
     expected_name: Optional[str]
     note: str
 
+class DiscoverAsyncReq(BaseModel):
+    sources: str
+    limit: int = 100
+    min_views: int = 0
+    min_duration: int = 0
+    max_duration: int = 0
+    dateafter: str = ""
+    match_filter: str = ""
+    format: Literal["json", "csv", "ndjson"] = "json"
+    fields: str = ""
+    timeout: int = DISCOVER_TIMEOUT
+    fast: bool = False
+    concurrency: int = 6
+    per_item_timeout: int = 25
+    debug: bool = False
+    callback_url: Optional[str] = None
+    filename_hint: Optional[str] = None
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # FastAPI app
@@ -315,29 +338,22 @@ def healthz():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# /discover — multi-source with rich defaults (+fast mode, max_duration) [ROBUST]
+# Core discover engine (re-usable by sync + async endpoints)
 # ──────────────────────────────────────────────────────────────────────────────
-@app.get("/discover")
-async def discover(
-    sources: str = Query(..., description="Comma-separated channel/playlist/video URLs (any yt-dlp site)"),
-    limit: int = Query(100, ge=1, le=1000, description="Max items per source"),
-    # filters:
-    min_views: int = Query(0, ge=0, description="view_count >= this"),
-    min_duration: int = Query(0, ge=0, description="duration >= this (sec)"),
-    max_duration: int = Query(0, ge=0, description="duration <= this (sec)"),
-    dateafter: str = Query("", description='yt-dlp --dateafter (e.g. "now-30days", "20240101")'),
-    # advanced:
-    match_filter: str = Query("", description='raw yt-dlp --match-filter (overrides simple knobs)'),
-    # output:
-    format: str = Query("json", pattern="^(json|ndjson|csv)$"),
-    fields: str = Query(DEFAULT_DISCOVER_FIELDS, description='Comma-separated fields ("*" or empty = defaults)'),
-    timeout: int = Query(DISCOVER_TIMEOUT, ge=10, le=3600, description="Overall server-side time budget (seconds)"),
-    # fast mode knobs:
-    fast: bool = Query(False, description="Enable flat listing + concurrent per-entry fetches"),
-    concurrency: int = Query(6, ge=1, le=20, description="Max concurrent entry fetches when fast=1"),
-    per_item_timeout: int = Query(25, ge=5, le=120, description="Per-entry dump-json timeout when fast=1"),
-    debug: bool = Query(False, description="Include extractor errors in rows"),
-):
+async def run_discover_engine(
+    sources: str,
+    limit: int,
+    min_views: int,
+    min_duration: int,
+    max_duration: int,
+    dateafter: str,
+    match_filter: str,
+    timeout: int,
+    fast: bool,
+    concurrency: int,
+    per_item_timeout: int,
+    debug: bool,
+) -> List[Dict]:
     src_list = [s.strip() for s in sources.split(",") if s.strip()]
     if not src_list:
         raise HTTPException(status_code=400, detail="No sources provided")
@@ -348,19 +364,14 @@ async def discover(
         extra_args += ["--match-filter", match_filter]
     else:
         clauses = []
-        if min_duration > 0:
-            clauses.append(f"duration >= {min_duration}")
-        if max_duration > 0:
-            clauses.append(f"duration <= {max_duration}")
-        if min_views > 0:
-            clauses.append(f"view_count >= {min_views}")
+        if min_duration > 0: clauses.append(f"duration >= {min_duration}")
+        if max_duration > 0: clauses.append(f"duration <= {max_duration}")
+        if min_views > 0:    clauses.append(f"view_count >= {min_views}")
         if clauses:
             extra_args += ["--match-filter", " & ".join(clauses)]
     if dateafter:
         extra_args += ["--dateafter", dateafter]
-
-    # tolerate hiccups
-    extra_args += ["--ignore-errors"]
+    extra_args += ["--ignore-errors"]  # tolerate hiccups
 
     rows: List[Dict] = []
 
@@ -382,24 +393,19 @@ async def discover(
                 flat_urls = await ytdlp_flat_entries(src, extra_args=extra_args, timeout=min(120, await time_left()))
                 if not flat_urls:
                     raise RuntimeError("No entries (flat)")
-
                 # 2) Trim to limit early
                 flat_urls = flat_urls[:limit]
-
                 # 3) Build coroutine factories for concurrent per-entry dump-json
                 def make_coro(u):
                     async def _c():
                         return await ytdlp_dump_json(u, extra_args=extra_args, timeout=min(per_item_timeout, await time_left()))
                     return _c
-
                 coros = [make_coro(u) for u in flat_urls]
                 metas = await gather_limited(coros, limit=concurrency, overall_timeout=await time_left())
-
                 # 4) Normalize each successful meta
                 for m in metas:
                     if isinstance(m, dict):
                         rows.append(normalize_entry(m))
-
                 # If nothing succeeded, fall back to monolithic -J (single try within remaining time)
                 if not rows:
                     data = await ytdlp_playlist_json(src, extra_args=extra_args, timeout=min(120, await time_left()))
@@ -410,7 +416,6 @@ async def discover(
                                 rows.append(normalize_entry(e))
                     else:
                         rows.append(normalize_entry(data))
-
             else:
                 # Original path (monolithic -J)
                 data = await ytdlp_playlist_json(src, extra_args=extra_args, timeout=min(240, await time_left()))
@@ -433,14 +438,46 @@ async def discover(
             })
             # continue to next source
 
-    # Field selection — fall back to defaults if empty/"*"
+    return rows
+
+
+def pick_fields(items: List[Dict], fields: str) -> (List[str], List[Dict]):
     raw_fields = (fields or "").strip()
     if not raw_fields or raw_fields == "*":
         raw_fields = DEFAULT_DISCOVER_FIELDS
     field_list = [f.strip() for f in raw_fields.split(",") if f.strip()]
+    projected = [{k: r.get(k) for k in field_list} for r in items]
+    return field_list, projected
 
-    # Project items to requested fields
-    items = [{k: r.get(k) for k in field_list} for r in rows]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# /discover — synchronous (kept for simple cases)
+# ──────────────────────────────────────────────────────────────────────────────
+@app.get("/discover")
+async def discover(
+    sources: str = Query(..., description="Comma-separated channel/playlist/video URLs (any yt-dlp site)"),
+    limit: int = Query(100, ge=1, le=1000, description="Max items per source"),
+    min_views: int = Query(0, ge=0, description="view_count >= this"),
+    min_duration: int = Query(0, ge=0, description="duration >= this (sec)"),
+    max_duration: int = Query(0, ge=0, description="duration <= this (sec)"),
+    dateafter: str = Query("", description='yt-dlp --dateafter (e.g. "now-30days", "20240101")'),
+    match_filter: str = Query("", description='raw yt-dlp --match-filter (overrides simple knobs)'),
+    format: str = Query("json", pattern="^(json|ndjson|csv)$"),
+    fields: str = Query(DEFAULT_DISCOVER_FIELDS, description='Comma-separated fields ("*" or empty = defaults)'),
+    timeout: int = Query(DISCOVER_TIMEOUT, ge=10, le=3600, description="Overall server-side time budget (seconds)"),
+    fast: bool = Query(False, description="Enable flat listing + concurrent per-entry fetches"),
+    concurrency: int = Query(6, ge=1, le=20, description="Max concurrent entry fetches when fast=1"),
+    per_item_timeout: int = Query(25, ge=5, le=120, description="Per-entry dump-json timeout when fast=1"),
+    debug: bool = Query(False, description="Include extractor errors in rows"),
+):
+    rows = await run_discover_engine(
+        sources=sources, limit=limit, min_views=min_views,
+        min_duration=min_duration, max_duration=max_duration,
+        dateafter=dateafter, match_filter=match_filter,
+        timeout=timeout, fast=fast, concurrency=concurrency,
+        per_item_timeout=per_item_timeout, debug=debug
+    )
+    field_list, items = pick_fields(rows, fields)
 
     if format == "csv":
         csv_text = to_csv(items, field_list)
@@ -452,7 +489,161 @@ async def discover(
         return JSONResponse({
             "count": len(items),
             "fetched_at": datetime.utcnow().isoformat(),
-            "sources": src_list,
+            "sources": [s.strip() for s in sources.split(",") if s.strip()],
+            "fields": field_list,
+            "items": items,
+        })
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# /discover_async — queue a job and return immediately
+# ──────────────────────────────────────────────────────────────────────────────
+@app.post("/discover_async")
+async def discover_async(req: DiscoverAsyncReq, bg: BackgroundTasks):
+    job_id = f"djob_{uuid.uuid4().hex[:10]}"
+    now = datetime.utcnow().isoformat()
+
+    with JOB_LOCK:
+        JOB_STORE[job_id] = {
+            "status": "queued",
+            "created_at": now,
+            "updated_at": now,
+            "req": req.dict(),
+            "format": req.format,
+            "fields": req.fields,
+            "result": None,
+            "error": None,
+            "expires_at": (datetime.utcnow() + timedelta(seconds=JOB_TTL_SECONDS)).isoformat()
+        }
+
+    bg.add_task(_discover_worker, job_id)
+    return {"job_id": job_id, "status": "queued"}
+
+
+async def _discover_worker(job_id: str):
+    with JOB_LOCK:
+        rec = JOB_STORE.get(job_id)
+        if not rec:
+            return
+        rec["status"] = "running"
+        rec["updated_at"] = datetime.utcnow().isoformat()
+
+    req: Dict = rec["req"]
+    try:
+        rows = await run_discover_engine(
+            sources=req["sources"], limit=req["limit"], min_views=req["min_views"],
+            min_duration=req["min_duration"], max_duration=req["max_duration"],
+            dateafter=req["dateafter"], match_filter=req["match_filter"],
+            timeout=req["timeout"], fast=req["fast"], concurrency=req["concurrency"],
+            per_item_timeout=req["per_item_timeout"], debug=req["debug"]
+        )
+        # Save raw rows; formatting is done at GET /discover_result time
+        with JOB_LOCK:
+            rec = JOB_STORE.get(job_id)
+            if rec:
+                rec["status"] = "done"
+                rec["result"] = rows
+                rec["updated_at"] = datetime.utcnow().isoformat()
+    except Exception as e:
+        with JOB_LOCK:
+            rec = JOB_STORE.get(job_id)
+            if rec:
+                rec["status"] = "error"
+                rec["error"] = str(e)
+                rec["updated_at"] = datetime.utcnow().isoformat()
+
+    # optional callback
+    with JOB_LOCK:
+        rec = JOB_STORE.get(job_id)
+        cb = rec["req"].get("callback_url") if rec else None
+        status = rec["status"] if rec else "unknown"
+    if cb:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                await client.post(cb, json={"job_id": job_id, "status": status})
+        except Exception:
+            pass
+
+    # Garbage collect expired jobs
+    _gc_jobs()
+
+
+def _gc_jobs():
+    now = datetime.utcnow()
+    to_delete = []
+    with JOB_LOCK:
+        for jid, rec in JOB_STORE.items():
+            try:
+                exp = datetime.fromisoformat(rec.get("expires_at", "1970-01-01T00:00:00"))
+            except Exception:
+                exp = now
+            if now > exp:
+                to_delete.append(jid)
+        for jid in to_delete:
+            del JOB_STORE[jid]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# /discover_status — check job state
+# /discover_result — fetch final data (json/csv/ndjson)
+# ──────────────────────────────────────────────────────────────────────────────
+@app.get("/discover_status")
+async def discover_status(job_id: str = Query(...)):
+    with JOB_LOCK:
+        rec = JOB_STORE.get(job_id)
+        if not rec:
+            raise HTTPException(status_code=404, detail="job_id not found")
+        return {"job_id": job_id, "status": rec["status"], "updated_at": rec["updated_at"]}
+
+
+@app.get("/discover_result")
+async def discover_result(
+    job_id: str = Query(...),
+    format: str = Query("json", pattern="^(json|ndjson|csv)$"),
+    fields: str = Query("", description='Fields to output (empty or "*" = defaults)'),
+    filename_hint: str = Query("discover", description="Filename hint (no spaces, will be sanitized)"),
+):
+    with JOB_LOCK:
+        rec = JOB_STORE.get(job_id)
+        if not rec:
+            raise HTTPException(status_code=404, detail="job_id not found")
+        status = rec["status"]
+        rows = rec["result"]
+        err = rec["error"]
+
+    if status == "queued" or status == "running":
+        return JSONResponse({"job_id": job_id, "status": status}, status_code=202)
+    if status == "error":
+        raise HTTPException(status_code=500, detail=err or "Unknown error")
+
+    # done
+    field_list, items = pick_fields(rows, fields or "")
+
+    # filename
+    hint = sanitize_filename(filename_hint.lower().replace(" ", "_"))[:40] or "discover"
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    ext = "ndjson" if format == "ndjson" else format
+    filename = f"discover_{hint}_{ts}.{ext}"
+
+    if format == "csv":
+        csv_text = to_csv(items, field_list)
+        return PlainTextResponse(
+            csv_text,
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+        )
+    elif format == "ndjson":
+        ndjson_text = to_ndjson(items)
+        return PlainTextResponse(
+            ndjson_text,
+            media_type="application/x-ndjson; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+        )
+    else:
+        return JSONResponse({
+            "job_id": job_id,
+            "count": len(items),
+            "fetched_at": datetime.utcnow().isoformat(),
             "fields": field_list,
             "items": items,
         })
@@ -461,21 +652,6 @@ async def discover(
 # ──────────────────────────────────────────────────────────────────────────────
 # /download — Rumble → mp4 → Drive upload (+callback with metadata)
 # ──────────────────────────────────────────────────────────────────────────────
-class DownloadReq(BaseModel):
-    url: str
-    tag: Optional[str] = Field(default_factory=lambda: f"job_{uuid.uuid4().hex[:8]}")
-    drive_folder: Optional[str] = None
-    expected_name: Optional[str] = None
-    callback_url: Optional[str] = None
-    quality: Literal["BEST_ORIGINAL", "BEST_MP4", "STRICT_MP4_REENC"] = "BEST_MP4"
-    timeout: Optional[int] = DOWNLOAD_TIMEOUT
-
-class DownloadAck(BaseModel):
-    accepted: bool
-    tag: str
-    expected_name: Optional[str]
-    note: str
-
 @app.post("/download", response_model=DownloadAck)
 async def download(req: DownloadReq, bg: BackgroundTasks):
     if not req.url or "rumble.com" not in req.url.lower():
