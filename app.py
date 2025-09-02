@@ -7,12 +7,16 @@ import base64
 import shutil
 import tempfile
 import uuid
+import pathlib
+import time
+import threading
 from io import StringIO
-from typing import Optional, Literal, List, Dict
+from typing import Optional, Literal, List, Dict, Any
 from datetime import datetime, timedelta
 
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Query
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Query, Header
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 
 import httpx
@@ -28,16 +32,17 @@ from threading import Lock
 
 # ----------------------- Config -----------------------
 APP_PORT = int(os.getenv("PORT", "8000"))
-AUTH_MODE = (os.getenv("DRIVE_AUTH") or "oauth").lower()  # "oauth" | "service"
 
+AUTH_MODE = (os.getenv("DRIVE_AUTH") or "oauth").lower()  # "oauth" | "service"
 DEFAULT_DRIVE_FOLDER_ID = (os.getenv("DRIVE_FOLDER_ID") or "").strip() or None
 DRIVE_PUBLIC = (os.getenv("DRIVE_PUBLIC") or "false").lower() == "true"
+
 DELETE_LOCAL_AFTER_UPLOAD = (os.getenv("DELETE_LOCAL_AFTER_UPLOAD") or "true").lower() == "true"
+# for the single-use link we DO NOT delete immediately; deletion is handled by /once
 
 DISCOVER_TIMEOUT = int(os.getenv("DISCOVER_TIMEOUT_SEC") or 180)        # sync
 DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT_SEC") or 1800)       # download worker
 
-# Async discover defaults (server-controlled)
 DISCOVER_FAST_DEFAULT = (os.getenv("DISCOVER_FAST_DEFAULT") or "true").lower() == "true"
 DISCOVER_CONCURRENCY_DEFAULT = int(os.getenv("DISCOVER_CONCURRENCY_DEFAULT") or 6)
 DISCOVER_PER_ITEM_TIMEOUT_DEFAULT = int(os.getenv("DISCOVER_PER_ITEM_TIMEOUT_DEFAULT") or 20)
@@ -49,12 +54,24 @@ DEFAULT_DISCOVER_FIELDS = (
     "thumbnail"
 )
 
+# Public serving (single-use token)
+PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").rstrip("/")
+PUBLIC_FILES_DIR = os.getenv("PUBLIC_FILES_DIR", "/data/public")
+os.makedirs(PUBLIC_FILES_DIR, exist_ok=True)
+ONCE_TOKEN_TTL_SEC = int(os.getenv("ONCE_TOKEN_TTL_SEC", "86400"))  # 24h
+ALLOW_ANY_URL = (os.getenv("ALLOW_ANY_URL") or "false").lower() == "true"
+
+# In-memory single-use registry: token -> meta
+ONCE_TOKENS: Dict[str, Dict[str, Any]] = {}
+
 JOB_STORE: Dict[str, dict] = {}
 JOB_LOCK = Lock()
 JOB_TTL_SECONDS = int(os.getenv("JOB_TTL_SECONDS") or 3600)
 
 # ----------------------- Drive -----------------------
 def build_drive_service():
+    if not (DEFAULT_DRIVE_FOLDER_ID or os.getenv("GOOGLE_REFRESH_TOKEN") or os.getenv("DRIVE_SERVICE_ACCOUNT_JSON") or os.getenv("DRIVE_SERVICE_ACCOUNT_JSON_B64")):
+        return None  # allow running without Drive creds
     if AUTH_MODE == "oauth":
         client_id = os.getenv("GOOGLE_CLIENT_ID")
         client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
@@ -103,7 +120,9 @@ async def run(cmd: List[str], timeout: Optional[int] = None) -> tuple[int, str, 
         return 124, "", "Timeout"
     return proc.returncode, stdout.decode(errors="ignore"), stderr.decode(errors="ignore")
 
-def upload_to_drive(local_path: str, out_name: str, folder_id: Optional[str]) -> dict:
+def upload_to_drive(local_path: str, out_name: str, folder_id: Optional[str]) -> Optional[dict]:
+    if not drive_service or not folder_id:
+        return None
     meta = {"name": out_name}
     if folder_id:
         meta["parents"] = [folder_id]
@@ -269,11 +288,150 @@ app = FastAPI()
 
 @app.get("/")
 def root():
-    return {"status": "ok", "auth_mode": AUTH_MODE, "time": datetime.utcnow().isoformat()}
+    return {
+        "status": "ok",
+        "auth_mode": AUTH_MODE if drive_service else "disabled",
+        "time": datetime.utcnow().isoformat()
+    }
 
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
+
+# ----------------------- Single-use link helpers -----------------------
+def _file_stat(path: str) -> tuple[int, str]:
+    p = pathlib.Path(path)
+    if not p.exists() or not p.is_file():
+        raise FileNotFoundError
+    return (p.stat().st_size, p.name)
+
+def make_single_use_url(filename: str, base_url: Optional[str] = None) -> str:
+    """
+    Register a file that already exists in PUBLIC_FILES_DIR for a one-time download.
+    """
+    path = os.path.join(PUBLIC_FILES_DIR, filename)
+    size, _ = _file_stat(path)
+    token = uuid.uuid4().hex
+    ONCE_TOKENS[token] = {
+        "path": path,
+        "size": size,
+        "active": 0,          # concurrent stream count
+        "consumed": False,    # set true once any bytes are sent successfully
+        "last_seen": time.time(),
+        "expiry": time.time() + ONCE_TOKEN_TTL_SEC,
+    }
+    base = (base_url or PUBLIC_BASE_URL).rstrip("/")
+    if not base:
+        return f"/once/{token}"
+    return f"{base}/once/{token}"
+
+def _maybe_delete_and_purge(token: str):
+    meta = ONCE_TOKENS.get(token)
+    if not meta:
+        return
+    # delete only when all streams finished and at least one emitted bytes
+    if meta["active"] == 0 and meta["consumed"]:
+        try:
+            if os.path.exists(meta["path"]):
+                os.remove(meta["path"])
+        except Exception:
+            pass
+        ONCE_TOKENS.pop(token, None)
+
+def _janitor_loop():
+    while True:
+        try:
+            now = time.time()
+            expired = []
+            for tk, meta in list(ONCE_TOKENS.items()):
+                if now > meta.get("expiry", 0):
+                    expired.append(tk)
+            for tk in expired:
+                m = ONCE_TOKENS.pop(tk, None)
+                if m and os.path.exists(m["path"]) and not m["consumed"]:
+                    # token expired without a successful download → delete to free disk
+                    try:
+                        os.remove(m["path"])
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        time.sleep(60)
+
+threading.Thread(target=_janitor_loop, daemon=True).start()
+
+@app.get("/once/{token}")
+def serve_single_use(token: str, range_header: Optional[str] = Header(default=None, alias="Range")):
+    """
+    Streams the file ONCE (supports Range). After all concurrent streams finish,
+    the file is deleted and the token is invalidated.
+    """
+    meta = ONCE_TOKENS.get(token)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Expired or invalid link")
+
+    path = meta["path"]
+    if not os.path.exists(path):
+        ONCE_TOKENS.pop(token, None)
+        raise HTTPException(status_code=404, detail="File not found")
+
+    size = meta["size"]
+    meta["last_seen"] = time.time()
+
+    start, end = 0, size - 1
+    status_code = 200
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "no-store",
+        "Content-Disposition": f'inline; filename="{pathlib.Path(path).name}"',
+        "Content-Type": "video/mp4",  # adjust by extension if needed
+    }
+
+    # Parse Range
+    if range_header and size > 0:
+        try:
+            unit, rng = range_header.split("=")
+            s, e = rng.split("-")
+            start = int(s) if s else 0
+            end = int(e) if e else (size - 1)
+            if end >= size:
+                end = size - 1
+            if start > end or start >= size:
+                raise ValueError
+            headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+            headers["Content-Length"] = str(end - start + 1)
+            status_code = 206
+        except Exception:
+            start, end = 0, size - 1
+            headers["Content-Length"] = str(size)
+            status_code = 200
+    else:
+        headers["Content-Length"] = str(size)
+
+    meta["active"] += 1
+
+    def file_iter():
+        emitted_any = False
+        try:
+            with open(path, "rb") as f:
+                f.seek(start)
+                remaining = end - start + 1
+                chunk = 1024 * 1024  # 1 MiB
+                while remaining > 0:
+                    to_read = chunk if remaining >= chunk else remaining
+                    data = f.read(to_read)
+                    if not data:
+                        break
+                    emitted_any = True
+                    yield data
+                    remaining -= len(data)
+        finally:
+            meta["active"] -= 1
+            if emitted_any:
+                meta["consumed"] = True
+            _maybe_delete_and_purge(token)
+
+    return StreamingResponse(file_iter(), status_code=status_code, headers=headers)
 
 # ----------------------- Core discover engine -----------------------
 async def run_discover_engine(
@@ -405,27 +563,8 @@ async def discover(
     })
 
 # ----------------------- Async job API -----------------------
-class DiscoverAsyncReq(BaseModel):
-    sources: str
-    limit: int = 100
-    min_views: int = 0
-    min_duration: int = 0
-    max_duration: int = 0
-    dateafter: str = ""
-    match_filter: str = ""
-    format: Literal["json", "csv", "ndjson"] = "json"
-    fields: str = ""
-    timeout: Optional[int] = None
-    fast: Optional[bool] = None
-    concurrency: Optional[int] = None
-    per_item_timeout: Optional[int] = None
-    debug: Optional[bool] = None
-    callback_url: Optional[str] = None
-    filename_hint: Optional[str] = None
-
 @app.post("/discover_async")
 async def discover_async(req: DiscoverAsyncReq, bg: BackgroundTasks):
-    # resolve server-side defaults (ignore/override missing values)
     timeout = req.timeout if (req.timeout and req.timeout > 0) else DISCOVER_TIMEOUT_DEFAULT
     fast = DISCOVER_FAST_DEFAULT if req.fast is None else bool(req.fast)
     concurrency = req.concurrency or DISCOVER_CONCURRENCY_DEFAULT
@@ -577,40 +716,31 @@ async def discover_result(
     })
 
 # ----------------------- /download -----------------------
-class DownloadReq(BaseModel):
-    url: str
-    tag: Optional[str] = Field(default_factory=lambda: f"job_{uuid.uuid4().hex[:8]}")
-    drive_folder: Optional[str] = None
-    expected_name: Optional[str] = None
-    callback_url: Optional[str] = None
-    quality: Literal["BEST_ORIGINAL", "BEST_MP4", "STRICT_MP4_REENC"] = "BEST_MP4"
-    timeout: Optional[int] = DOWNLOAD_TIMEOUT
-
-class DownloadAck(BaseModel):
-    accepted: bool
-    tag: str
-    expected_name: Optional[str]
-    note: str
-
 @app.post("/download", response_model=DownloadAck)
 async def download(req: DownloadReq, bg: BackgroundTasks):
-    if not req.url or "rumble.com" not in req.url.lower():
-        raise HTTPException(status_code=400, detail="Only rumble.com links are supported")
+    # Allow any URL if env says so, otherwise keep rumble restriction
+    if not req.url:
+        raise HTTPException(status_code=400, detail="Missing url")
+    if (not ALLOW_ANY_URL) and ("rumble.com" not in req.url.lower()):
+        raise HTTPException(status_code=400, detail="Only rumble.com links are supported (set ALLOW_ANY_URL=true to override)")
+
     expected = req.expected_name or f"{req.tag}.mp4"
     expected = sanitize_filename(expected)
     if not expected.lower().endswith(".mp4"):
         expected += ".mp4"
+
+    # Drive upload is optional now. If neither req.drive_folder nor DEFAULT_DRIVE_FOLDER_ID is set, we just skip Drive.
     folder_id = req.drive_folder or DEFAULT_DRIVE_FOLDER_ID
-    if not folder_id:
-        raise HTTPException(status_code=400, detail="No Drive folder provided and no default DRIVE_FOLDER_ID")
+
     bg.add_task(worker_job, req, expected, folder_id)
     return DownloadAck(accepted=True, tag=req.tag, expected_name=expected, note="processing")
 
-async def worker_job(req: DownloadReq, expected_name: str, folder_id: str):
+async def worker_job(req: DownloadReq, expected_name: str, folder_id: Optional[str]):
     started_iso = datetime.utcnow().isoformat()
     work_dir = tempfile.mkdtemp(prefix="dl_")
     temp_tpl = os.path.join(work_dir, f"{req.tag}.%(ext)s")
     out_local = os.path.join(work_dir, expected_name)
+    public_path = os.path.join(PUBLIC_FILES_DIR, expected_name)
     try:
         base_cmd = ["yt-dlp", "--no-warnings", "--newline", "--force-ipv4", "-o", temp_tpl, req.url]
         if req.quality == "BEST_ORIGINAL":
@@ -644,6 +774,7 @@ async def worker_job(req: DownloadReq, expected_name: str, folder_id: str):
         files.sort(key=lambda f: os.path.getmtime(os.path.join(work_dir, f)), reverse=True)
         dl_path = os.path.join(work_dir, files[0])
 
+        # Normalize to mp4 if needed
         if not dl_path.lower().endswith(".mp4") and expected_name.lower().endswith(".mp4"):
             rc2, _, _ = await run(["ffmpeg", "-y", "-i", dl_path, "-c", "copy", out_local], timeout=600)
             if rc2 != 0:
@@ -660,8 +791,18 @@ async def worker_job(req: DownloadReq, expected_name: str, folder_id: str):
         else:
             shutil.move(dl_path, out_local)
 
-        up = upload_to_drive(out_local, expected_name, folder_id)
+        # Move into public dir (Railway volume)
+        shutil.move(out_local, public_path)
 
+        # Optionally upload to Drive (does NOT delete the public file; /once handles deletion)
+        up = None
+        try:
+            if folder_id:
+                up = upload_to_drive(public_path, expected_name, folder_id)
+        except Exception as _:
+            up = {"_upload_error": "drive upload failed"}
+
+        # Try to gather metadata (best-effort)
         meta = {}
         try:
             rc_meta, so_meta, se_meta = await run(["yt-dlp", "--dump-json", "--no-warnings", "--force-ipv4", req.url], timeout=90)
@@ -690,22 +831,28 @@ async def worker_job(req: DownloadReq, expected_name: str, folder_id: str):
         except Exception as _e:
             meta = {"_meta_error": str(_e)[:200]}
 
-        if DELETE_LOCAL_AFTER_UPLOAD and os.path.exists(out_local):
-            try:
-                os.remove(out_local)
-            except Exception:
-                pass
+        # Build single-use URL (auto-deletes after first full transfer)
+        once_url = make_single_use_url(expected_name, base_url=PUBLIC_BASE_URL)
 
-        await safe_callback(req.callback_url or "", {
-            "status": "done",
+        # NOTE: Do NOT delete public_path here; deletion happens after /once finishes streaming
+
+        payload = {
+            "status": "ready",
             "tag": req.tag,
             "expected_name": expected_name,
-            "drive_file_id": up["file_id"],
-            "drive_link": up["drive_link"],
+            "once_url": once_url,
+            "expires_in_sec": ONCE_TOKEN_TTL_SEC,
             "metadata": meta,
             "started_at": started_iso,
             "completed_at": datetime.utcnow().isoformat()
-        })
+        }
+        if up:
+            payload["drive_file_id"] = up.get("file_id")
+            payload["drive_link"] = up.get("drive_link")
+            if "_upload_error" in up:
+                payload["_upload_error"] = up["_upload_error"]
+
+        await safe_callback(req.callback_url or "", payload)
 
     except Exception as e:
         await safe_callback(req.callback_url or "", {
