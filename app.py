@@ -191,7 +191,7 @@ def healthz():
     return {"ok": True}
 
 # ──────────────────────────────────────────────────────────────────────────────
-# /discover — multi-source with rich defaults (+max_duration)
+# /discover — multi-source with rich defaults (+max_duration)  [FIXED]
 # ──────────────────────────────────────────────────────────────────────────────
 @app.get("/discover")
 async def discover(
@@ -206,7 +206,7 @@ async def discover(
     match_filter: str = Query("", description='raw yt-dlp --match-filter (overrides the simple knobs if present)'),
     # output format:
     format: str = Query("json", pattern="^(json|ndjson|csv)$"),
-    fields: str = Query(DEFAULT_DISCOVER_FIELDS, description="Comma-separated fields to output"),
+    fields: str = Query(DEFAULT_DISCOVER_FIELDS, description="Comma-separated fields to output (\"*\" or empty = defaults)"),
     timeout: int = Query(180, ge=10, le=3600),
 ):
     src_list = [s.strip() for s in sources.split(",") if s.strip()]
@@ -226,10 +226,13 @@ async def discover(
         if min_views > 0:
             clauses.append(f"view_count >= {min_views}")
         if clauses:
-            # Use OR or AND? For discovery, AND is usually what we want for stacked filters
+            # AND = all constraints must hold
             extra_args += ["--match-filter", " & ".join(clauses)]
     if dateafter:
         extra_args += ["--dateafter", dateafter]
+
+    # Be tolerant to extractor hiccups
+    extra_args += ["--ignore-errors"]
 
     rows: List[Dict] = []
     for src in src_list:
@@ -238,19 +241,31 @@ async def discover(
         except Exception as e:
             rows.append({
                 "id": "", "title": f"[DISCOVER ERROR] {src}", "url": src,
-                "uploader": "", "channel": "", "extractor": "", "upload_date": None,
-                "duration": None, "view_count": None, "like_count": None,
-                "dislike_count": None, "comment_count": None, "rumbles": None,
-                "thumbnail": "", "error": str(e)
+                "uploader": "", "channel": "", "channel_id": "", "extractor": "",
+                "upload_date": None, "duration": None, "view_count": None,
+                "like_count": None, "dislike_count": None, "comment_count": None,
+                "rumbles": None, "thumbnail": "", "error": str(e)[:500]
             })
             continue
 
-        entries = (data.get("entries") or [])[:limit]
-        for e in entries:
-            rows.append(normalize_entry(e))
+        # Handle both playlist/channel (with entries) and single video (no entries)
+        entries = data.get("entries")
+        if isinstance(entries, list) and entries:
+            for e in entries[:limit]:
+                if not isinstance(e, dict):
+                    continue
+                rows.append(normalize_entry(e))
+        else:
+            # Single video JSON object
+            rows.append(normalize_entry(data))
 
-    # Select fields & render
-    field_list = [f.strip() for f in fields.split(",") if f.strip()]
+    # Fields selection — fall back to defaults if empty/"*"
+    raw_fields = (fields or "").strip()
+    if not raw_fields or raw_fields == "*":
+        raw_fields = DEFAULT_DISCOVER_FIELDS
+    field_list = [f.strip() for f in raw_fields.split(",") if f.strip()]
+
+    # Project items to requested fields
     items = [{k: r.get(k) for k in field_list} for r in rows]
 
     if format == "csv":
