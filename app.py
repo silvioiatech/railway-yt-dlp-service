@@ -7,6 +7,7 @@ import base64
 import shutil
 import tempfile
 import uuid
+import itertools
 from io import StringIO
 from typing import Optional, Literal, List, Dict
 from datetime import datetime
@@ -23,6 +24,8 @@ from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+
+from asyncio import Semaphore, wait_for, TimeoutError as AsyncTimeout
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -182,11 +185,10 @@ async def ytdlp_playlist_json(source_url: str, extra_args: Optional[List[str]] =
     Robust wrapper around `yt-dlp -J` that:
       - tries the given URL
       - if it's a Rumble channel (/c/NAME), retries with /videos and with API hint
-      - adds compatibility flags to reduce extractor/CND issues
+      - adds compatibility flags to reduce extractor/CDN issues
     """
-    base = ["yt-dlp", "-J", "--no-warnings", "--ignore-errors"]
-    compat = ["--force-ipv4"]  # helps with some CDNs
-    args = base + (extra_args or []) + compat + [source_url]
+    base = ["yt-dlp", "-J", "--no-warnings", "--ignore-errors", "--force-ipv4"]
+    args = base + (extra_args or []) + [source_url]
 
     rc, so, se = await run(args, timeout=timeout)
     if rc == 0:
@@ -198,7 +200,7 @@ async def ytdlp_playlist_json(source_url: str, extra_args: Optional[List[str]] =
     # RUMBLE FALLBACKS
     if "rumble.com" in source_url and "/c/" in source_url:
         alt = source_url.rstrip("/") + "/videos"
-        args_alt = base + (extra_args or []) + compat + [alt]
+        args_alt = base + (extra_args or []) + [alt]
         rc2, so2, se2 = await run(args_alt, timeout=timeout)
         if rc2 == 0:
             try:
@@ -209,7 +211,7 @@ async def ytdlp_playlist_json(source_url: str, extra_args: Optional[List[str]] =
         # Best-effort extractor hint (ignored if unsupported)
         args_alt2 = base + (extra_args or []) + [
             "--extractor-args", "rumble:use_api=1"
-        ] + compat + [alt]
+        ] + [alt]
         rc3, so3, se3 = await run(args_alt2, timeout=timeout)
         if rc3 == 0:
             try:
@@ -221,6 +223,60 @@ async def ytdlp_playlist_json(source_url: str, extra_args: Optional[List[str]] =
 
     # Non-Rumble: return the stderr snippet for debugging
     raise RuntimeError(f"yt-dlp -J failed (rc={rc}). stderr={se[-500:]}")
+
+async def ytdlp_flat_entries(source_url: str, extra_args: Optional[List[str]] = None, timeout: int = 120) -> List[str]:
+    """
+    Use --flat-playlist to get entry URLs quickly, then we can fetch each entry's metadata separately.
+    """
+    base = ["yt-dlp", "-J", "--flat-playlist", "--no-warnings", "--ignore-errors", "--force-ipv4"]
+    args = base + (extra_args or []) + [source_url]
+    rc, so, se = await run(args, timeout=timeout)
+    if rc != 0:
+        raise RuntimeError(f"yt-dlp --flat-playlist failed: {se[-500:]}")
+    data = json.loads(so)
+    entries = data.get("entries") or []
+    urls = []
+    for e in entries:
+        u = e.get("url") or e.get("webpage_url")
+        if u:
+            urls.append(u)
+    return urls
+
+async def ytdlp_dump_json(entry_url: str, extra_args: Optional[List[str]] = None, timeout: int = 30) -> Optional[dict]:
+    """
+    Dump a single entry's JSON (fast). Returns None on non-fatal failure.
+    """
+    base = ["yt-dlp", "--dump-json", "--no-warnings", "--ignore-errors", "--force-ipv4"]
+    args = base + (extra_args or []) + [entry_url]
+    rc, so, se = await run(args, timeout=timeout)
+    if rc != 0:
+        return None
+    line = next((ln for ln in so.splitlines() if ln.strip().startswith("{")), None)
+    return json.loads(line) if line else None
+
+async def gather_limited(coros, limit: int, overall_timeout: int) -> List[Optional[dict]]:
+    """
+    Run coroutines with a concurrency limit and an overall deadline.
+    """
+    sem = Semaphore(max(1, limit))
+
+    async def run_one(coro_factory):
+        async with sem:
+            return await coro_factory()
+
+    tasks = [run_one(cf) for cf in coros]
+    try:
+        return await wait_for(asyncio.gather(*tasks, return_exceptions=False), timeout=overall_timeout)
+    except AsyncTimeout:
+        # Return only results from tasks that finished
+        done = []
+        for t in tasks:
+            if hasattr(t, 'done') and t.done() and not t.cancelled():
+                try:
+                    done.append(t.result())
+                except Exception:
+                    done.append(None)
+        return done
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -259,30 +315,34 @@ def healthz():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# /discover — multi-source with rich defaults (+max_duration) [ROBUST]
+# /discover — multi-source with rich defaults (+fast mode, max_duration) [ROBUST]
 # ──────────────────────────────────────────────────────────────────────────────
 @app.get("/discover")
 async def discover(
     sources: str = Query(..., description="Comma-separated channel/playlist/video URLs (any yt-dlp site)"),
     limit: int = Query(100, ge=1, le=1000, description="Max items per source"),
-    # easy filters:
-    min_views: int = Query(0, ge=0, description="Keep items with view_count >= this"),
-    min_duration: int = Query(0, ge=0, description="Keep items with duration >= this (sec)"),
-    max_duration: int = Query(0, ge=0, description="Keep items with duration <= this (sec)"),
+    # filters:
+    min_views: int = Query(0, ge=0, description="view_count >= this"),
+    min_duration: int = Query(0, ge=0, description="duration >= this (sec)"),
+    max_duration: int = Query(0, ge=0, description="duration <= this (sec)"),
     dateafter: str = Query("", description='yt-dlp --dateafter (e.g. "now-30days", "20240101")'),
     # advanced:
-    match_filter: str = Query("", description='raw yt-dlp --match-filter (overrides the simple knobs if present)'),
-    # output format:
+    match_filter: str = Query("", description='raw yt-dlp --match-filter (overrides simple knobs)'),
+    # output:
     format: str = Query("json", pattern="^(json|ndjson|csv)$"),
-    fields: str = Query(DEFAULT_DISCOVER_FIELDS, description='Comma-separated fields to output ("*" or empty = defaults)'),
-    timeout: int = Query(DISCOVER_TIMEOUT, ge=10, le=3600),
+    fields: str = Query(DEFAULT_DISCOVER_FIELDS, description='Comma-separated fields ("*" or empty = defaults)'),
+    timeout: int = Query(DISCOVER_TIMEOUT, ge=10, le=3600, description="Overall server-side time budget (seconds)"),
+    # fast mode knobs:
+    fast: bool = Query(False, description="Enable flat listing + concurrent per-entry fetches"),
+    concurrency: int = Query(6, ge=1, le=20, description="Max concurrent entry fetches when fast=1"),
+    per_item_timeout: int = Query(25, ge=5, le=120, description="Per-entry dump-json timeout when fast=1"),
     debug: bool = Query(False, description="Include extractor errors in rows"),
 ):
     src_list = [s.strip() for s in sources.split(",") if s.strip()]
     if not src_list:
         raise HTTPException(status_code=400, detail="No sources provided")
 
-    # Build yt-dlp filters
+    # Build filters
     extra_args: List[str] = []
     if match_filter:
         extra_args += ["--match-filter", match_filter]
@@ -295,18 +355,73 @@ async def discover(
         if min_views > 0:
             clauses.append(f"view_count >= {min_views}")
         if clauses:
-            # AND = all constraints must hold
             extra_args += ["--match-filter", " & ".join(clauses)]
     if dateafter:
         extra_args += ["--dateafter", dateafter]
 
-    # Be tolerant to extractor hiccups
+    # tolerate hiccups
     extra_args += ["--ignore-errors"]
 
     rows: List[Dict] = []
+
+    # Overall deadline for the whole endpoint
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+
+    async def time_left():
+        return max(1, int(deadline - loop.time()))
+
     for src in src_list:
+        # Normalize Rumble channel to /videos (more reliable)
+        if re.search(r"https?://(?:www\.)?rumble\.com/c/[^/]+/?$", src, re.I):
+            src = src.rstrip("/") + "/videos"
+
         try:
-            data = await ytdlp_playlist_json(src, extra_args=extra_args, timeout=timeout)
+            if fast:
+                # 1) Get a flat list of entry URLs quickly
+                flat_urls = await ytdlp_flat_entries(src, extra_args=extra_args, timeout=min(120, await time_left()))
+                if not flat_urls:
+                    raise RuntimeError("No entries (flat)")
+
+                # 2) Trim to limit early
+                flat_urls = flat_urls[:limit]
+
+                # 3) Build coroutine factories for concurrent per-entry dump-json
+                def make_coro(u):
+                    async def _c():
+                        return await ytdlp_dump_json(u, extra_args=extra_args, timeout=min(per_item_timeout, await time_left()))
+                    return _c
+
+                coros = [make_coro(u) for u in flat_urls]
+                metas = await gather_limited(coros, limit=concurrency, overall_timeout=await time_left())
+
+                # 4) Normalize each successful meta
+                for m in metas:
+                    if isinstance(m, dict):
+                        rows.append(normalize_entry(m))
+
+                # If nothing succeeded, fall back to monolithic -J (single try within remaining time)
+                if not rows:
+                    data = await ytdlp_playlist_json(src, extra_args=extra_args, timeout=min(120, await time_left()))
+                    entries = data.get("entries")
+                    if isinstance(entries, list) and entries:
+                        for e in entries[:limit]:
+                            if isinstance(e, dict):
+                                rows.append(normalize_entry(e))
+                    else:
+                        rows.append(normalize_entry(data))
+
+            else:
+                # Original path (monolithic -J)
+                data = await ytdlp_playlist_json(src, extra_args=extra_args, timeout=min(240, await time_left()))
+                entries = data.get("entries")
+                if isinstance(entries, list) and entries:
+                    for e in entries[:limit]:
+                        if isinstance(e, dict):
+                            rows.append(normalize_entry(e))
+                else:
+                    rows.append(normalize_entry(data))
+
         except Exception as e:
             err = {"error": str(e)[:500]} if debug else {}
             rows.append({
@@ -316,20 +431,9 @@ async def discover(
                 "like_count": None, "dislike_count": None, "comment_count": None,
                 "rumbles": None, "thumbnail": "", **err
             })
-            continue
+            # continue to next source
 
-        # Handle both playlist/channel (with entries) and single video (no entries)
-        entries = data.get("entries")
-        if isinstance(entries, list) and entries:
-            for e in entries[:limit]:
-                if not isinstance(e, dict):
-                    continue
-                rows.append(normalize_entry(e))
-        else:
-            # Single video JSON object
-            rows.append(normalize_entry(data))
-
-    # Fields selection — fall back to defaults if empty/"*"
+    # Field selection — fall back to defaults if empty/"*"
     raw_fields = (fields or "").strip()
     if not raw_fields or raw_fields == "*":
         raw_fields = DEFAULT_DISCOVER_FIELDS
@@ -357,6 +461,21 @@ async def discover(
 # ──────────────────────────────────────────────────────────────────────────────
 # /download — Rumble → mp4 → Drive upload (+callback with metadata)
 # ──────────────────────────────────────────────────────────────────────────────
+class DownloadReq(BaseModel):
+    url: str
+    tag: Optional[str] = Field(default_factory=lambda: f"job_{uuid.uuid4().hex[:8]}")
+    drive_folder: Optional[str] = None
+    expected_name: Optional[str] = None
+    callback_url: Optional[str] = None
+    quality: Literal["BEST_ORIGINAL", "BEST_MP4", "STRICT_MP4_REENC"] = "BEST_MP4"
+    timeout: Optional[int] = DOWNLOAD_TIMEOUT
+
+class DownloadAck(BaseModel):
+    accepted: bool
+    tag: str
+    expected_name: Optional[str]
+    note: str
+
 @app.post("/download", response_model=DownloadAck)
 async def download(req: DownloadReq, bg: BackgroundTasks):
     if not req.url or "rumble.com" not in req.url.lower():
@@ -438,7 +557,6 @@ async def worker_job(req: DownloadReq, expected_name: str, folder_id: str):
         # Enriched metadata (best-effort)
         meta = {}
         try:
-            # Prefer webpage_url for metadata fetch
             rc_meta, so_meta, se_meta = await run(["yt-dlp", "--dump-json", "--no-warnings", "--force-ipv4", req.url], timeout=90)
             if rc_meta == 0:
                 m = json.loads(next((ln for ln in so_meta.splitlines() if ln.strip().startswith("{")), "{}"))
