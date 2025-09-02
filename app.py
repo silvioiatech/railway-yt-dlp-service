@@ -1,4 +1,12 @@
-import os, re, json, asyncio, base64, tempfile, shutil, uuid, csv
+import os
+import re
+import json
+import csv
+import asyncio
+import base64
+import shutil
+import tempfile
+import uuid
 from io import StringIO
 from typing import Optional, Literal, List, Dict
 from datetime import datetime
@@ -16,33 +24,46 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Config
 # ──────────────────────────────────────────────────────────────────────────────
 APP_PORT = int(os.getenv("PORT", "8000"))
-DEFAULT_DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", "").strip() or None
-DRIVE_PUBLIC = os.getenv("DRIVE_PUBLIC", "false").lower() == "true"
-DELETE_LOCAL_AFTER_UPLOAD = os.getenv("DELETE_LOCAL_AFTER_UPLOAD", "true").lower() == "true"
-AUTH_MODE = os.getenv("DRIVE_AUTH", "oauth").lower()  # 'oauth' or 'service'
 
-# Default fields ALWAYS returned by /discover (unless you override via ?fields=)
+# Drive auth mode: "oauth" uses user refresh token, "service" uses service account
+AUTH_MODE = (os.getenv("DRIVE_AUTH") or "oauth").lower()  # "oauth" | "service"
+
+DEFAULT_DRIVE_FOLDER_ID = (os.getenv("DRIVE_FOLDER_ID") or "").strip() or None
+DRIVE_PUBLIC = (os.getenv("DRIVE_PUBLIC") or "false").lower() == "true"
+DELETE_LOCAL_AFTER_UPLOAD = (os.getenv("DELETE_LOCAL_AFTER_UPLOAD") or "true").lower() == "true"
+
+# yt-dlp Process Defaults
+DISCOVER_TIMEOUT = int(os.getenv("DISCOVER_TIMEOUT_SEC") or 180)
+DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT_SEC") or 1800)
+
+# Enriched default fields ALWAYS returned by /discover (unless explicitly overridden)
 DEFAULT_DISCOVER_FIELDS = (
     "id,title,url,uploader,channel,channel_id,extractor,"
     "upload_date,duration,view_count,like_count,dislike_count,comment_count,rumbles,"
     "thumbnail"
 )
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Drive client
 # ──────────────────────────────────────────────────────────────────────────────
 def build_drive_service():
+    """
+    Build a Google Drive service either via OAuth (refresh token) or Service Account.
+    Service Account requires Shared Drives or domain delegation to have storage quota.
+    """
     if AUTH_MODE == "oauth":
         client_id = os.getenv("GOOGLE_CLIENT_ID")
         client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
         refresh_token = os.getenv("GOOGLE_REFRESH_TOKEN")
         scopes = (os.getenv("GOOGLE_SCOPES") or "https://www.googleapis.com/auth/drive.file").split()
         if not (client_id and client_secret and refresh_token):
-            raise RuntimeError("OAuth selected but GOOGLE_CLIENT_ID/SECRET/REFRESH_TOKEN missing")
+            raise RuntimeError("OAuth selected but GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET/GOOGLE_REFRESH_TOKEN missing")
         creds = Credentials(
             None,
             refresh_token=refresh_token,
@@ -53,19 +74,21 @@ def build_drive_service():
         )
         return build("drive", "v3", credentials=creds, cache_discovery=False)
 
-    # service account (Workspace + Shared Drive)
-    service_json = os.getenv("DRIVE_SERVICE_ACCOUNT_JSON") or (
-        os.getenv("DRIVE_SERVICE_ACCOUNT_JSON_B64") and
-        base64.b64decode(os.getenv("DRIVE_SERVICE_ACCOUNT_JSON_B64")).decode("utf-8")
-    )
+    # Service account (Workspace shared drive or domain-delegated)
+    service_json = os.getenv("DRIVE_SERVICE_ACCOUNT_JSON")
+    if not service_json and os.getenv("DRIVE_SERVICE_ACCOUNT_JSON_B64"):
+        service_json = base64.b64decode(os.getenv("DRIVE_SERVICE_ACCOUNT_JSON_B64")).decode("utf-8")
     if not service_json:
-        raise RuntimeError("Service account selected but DRIVE_SERVICE_ACCOUNT_JSON(_B64) missing")
+        raise RuntimeError("Service auth selected but DRIVE_SERVICE_ACCOUNT_JSON(_B64) not provided")
     creds_info = json.loads(service_json)
     scopes = ["https://www.googleapis.com/auth/drive"]
     sa = service_account.Credentials.from_service_account_info(creds_info, scopes=scopes)
+    # NOTE: if you need domain-wide delegation, use sa.with_subject("user@domain.com")
     return build("drive", "v3", credentials=sa, cache_discovery=False)
 
+
 drive_service = build_drive_service()
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -81,8 +104,10 @@ async def run(cmd: List[str], timeout: Optional[int] = None) -> tuple[int, str, 
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
-        try: proc.kill()
-        except Exception: pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
         return 124, "", "Timeout"
     return proc.returncode, stdout.decode(errors="ignore"), stderr.decode(errors="ignore")
 
@@ -91,9 +116,11 @@ def upload_to_drive(local_path: str, out_name: str, folder_id: Optional[str]) ->
     if folder_id:
         file_metadata["parents"] = [folder_id]
     media = MediaFileUpload(local_path, resumable=True)
-    file = (drive_service.files()
-            .create(body=file_metadata, media_body=media, fields="id, webViewLink", supportsAllDrives=True)
-            .execute())
+    file = (
+        drive_service.files()
+        .create(body=file_metadata, media_body=media, fields="id, webViewLink", supportsAllDrives=True)
+        .execute()
+    )
     if DRIVE_PUBLIC:
         drive_service.permissions().create(
             fileId=file["id"], body={"role": "reader", "type": "anyone"}, supportsAllDrives=True
@@ -101,33 +128,24 @@ def upload_to_drive(local_path: str, out_name: str, folder_id: Optional[str]) ->
     return {"file_id": file["id"], "drive_link": file.get("webViewLink")}
 
 async def safe_callback(url: str, payload: dict):
-    if not url: return
+    if not url:
+        return
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             await client.post(url, json=payload)
     except Exception:
+        # Swallow callback errors to not break the worker
         pass
 
+
+# ──────────────────────────────────────────────────────────────────────────────
 # yt-dlp helpers
-async def get_metadata(url: str, timeout: int = 90) -> dict:
-    cmd = ["yt-dlp", "--dump-json", "--no-warnings", url]
-    rc, so, se = await run(cmd, timeout=timeout)
-    if rc != 0:
-        raise RuntimeError(f"yt-dlp --dump-json failed: {se[-500:]}")
-    line = next((ln for ln in so.splitlines() if ln.strip().startswith("{")), "{}")
-    return json.loads(line)
-
-async def ytdlp_playlist_json(source_url: str, extra_args: Optional[List[str]] = None, timeout: int = 180) -> dict:
-    args = ["yt-dlp", "-J", "--no-warnings", source_url]
-    if extra_args:
-        args[3:3] = extra_args
-    rc, so, se = await run(args, timeout=timeout)
-    if rc != 0:
-        raise RuntimeError(f"yt-dlp -J failed ({rc}): {se[-500:]}")
-    return json.loads(so)
-
+# ──────────────────────────────────────────────────────────────────────────────
 def normalize_entry(e: dict) -> dict:
-    # Try to expose as much useful info as available across extractors.
+    """
+    Normalize a yt-dlp entry across platforms.
+    Exposes as many useful metrics as available (likes, rumbles, dislikes, comments).
+    """
     rumble_count = e.get("rumble_count")
     like_count = e.get("like_count") or rumble_count
     return {
@@ -138,13 +156,13 @@ def normalize_entry(e: dict) -> dict:
         "channel": e.get("channel") or e.get("uploader") or "",
         "channel_id": e.get("channel_id") or e.get("uploader_id") or "",
         "extractor": e.get("extractor") or "",
-        "upload_date": e.get("upload_date"),          # YYYYMMDD
+        "upload_date": e.get("upload_date"),  # YYYYMMDD
         "duration": e.get("duration"),
         "view_count": e.get("view_count"),
-        "like_count": like_count,                     # YouTube/Rumble (mapped)
-        "dislike_count": e.get("dislike_count"),      # rare (YouTube cache/third-party)
+        "like_count": like_count,                   # YouTube/Rumble mapped
+        "dislike_count": e.get("dislike_count"),    # rarely available
         "comment_count": e.get("comment_count"),
-        "rumbles": rumble_count,                      # explicit Rumble metric
+        "rumbles": rumble_count,                    # explicit rumble metric
         "thumbnail": e.get("thumbnail") or "",
     }
 
@@ -159,8 +177,54 @@ def to_csv(rows: List[dict], fields: List[str]) -> str:
 def to_ndjson(rows: List[dict]) -> str:
     return "\n".join(json.dumps(r, ensure_ascii=False) for r in rows)
 
+async def ytdlp_playlist_json(source_url: str, extra_args: Optional[List[str]] = None, timeout: int = 180) -> dict:
+    """
+    Robust wrapper around `yt-dlp -J` that:
+      - tries the given URL
+      - if it's a Rumble channel (/c/NAME), retries with /videos and with API hint
+      - adds compatibility flags to reduce extractor/CND issues
+    """
+    base = ["yt-dlp", "-J", "--no-warnings", "--ignore-errors"]
+    compat = ["--force-ipv4"]  # helps with some CDNs
+    args = base + (extra_args or []) + compat + [source_url]
+
+    rc, so, se = await run(args, timeout=timeout)
+    if rc == 0:
+        try:
+            return json.loads(so)
+        except Exception:
+            pass  # fall through to retries
+
+    # RUMBLE FALLBACKS
+    if "rumble.com" in source_url and "/c/" in source_url:
+        alt = source_url.rstrip("/") + "/videos"
+        args_alt = base + (extra_args or []) + compat + [alt]
+        rc2, so2, se2 = await run(args_alt, timeout=timeout)
+        if rc2 == 0:
+            try:
+                return json.loads(so2)
+            except Exception:
+                pass
+
+        # Best-effort extractor hint (ignored if unsupported)
+        args_alt2 = base + (extra_args or []) + [
+            "--extractor-args", "rumble:use_api=1"
+        ] + compat + [alt]
+        rc3, so3, se3 = await run(args_alt2, timeout=timeout)
+        if rc3 == 0:
+            try:
+                return json.loads(so3)
+            except Exception:
+                pass
+
+        raise RuntimeError(f"yt-dlp -J failed for Rumble channel. stderr={se3 or se2 or se}")
+
+    # Non-Rumble: return the stderr snippet for debugging
+    raise RuntimeError(f"yt-dlp -J failed (rc={rc}). stderr={se[-500:]}")
+
+
 # ──────────────────────────────────────────────────────────────────────────────
-# API models
+# FastAPI models
 # ──────────────────────────────────────────────────────────────────────────────
 class DownloadReq(BaseModel):
     url: str
@@ -169,7 +233,7 @@ class DownloadReq(BaseModel):
     expected_name: Optional[str] = None
     callback_url: Optional[str] = None
     quality: Literal["BEST_ORIGINAL", "BEST_MP4", "STRICT_MP4_REENC"] = "BEST_MP4"
-    timeout: Optional[int] = 1800
+    timeout: Optional[int] = DOWNLOAD_TIMEOUT
 
 class DownloadAck(BaseModel):
     accepted: bool
@@ -177,21 +241,25 @@ class DownloadAck(BaseModel):
     expected_name: Optional[str]
     note: str
 
+
 # ──────────────────────────────────────────────────────────────────────────────
-# FastAPI
+# FastAPI app
 # ──────────────────────────────────────────────────────────────────────────────
 app = FastAPI()
+
 
 @app.get("/")
 def root():
     return {"status": "ok", "auth_mode": AUTH_MODE, "time": datetime.utcnow().isoformat()}
 
+
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
 
+
 # ──────────────────────────────────────────────────────────────────────────────
-# /discover — multi-source with rich defaults (+max_duration)  [FIXED]
+# /discover — multi-source with rich defaults (+max_duration) [ROBUST]
 # ──────────────────────────────────────────────────────────────────────────────
 @app.get("/discover")
 async def discover(
@@ -206,8 +274,9 @@ async def discover(
     match_filter: str = Query("", description='raw yt-dlp --match-filter (overrides the simple knobs if present)'),
     # output format:
     format: str = Query("json", pattern="^(json|ndjson|csv)$"),
-    fields: str = Query(DEFAULT_DISCOVER_FIELDS, description="Comma-separated fields to output (\"*\" or empty = defaults)"),
-    timeout: int = Query(180, ge=10, le=3600),
+    fields: str = Query(DEFAULT_DISCOVER_FIELDS, description='Comma-separated fields to output ("*" or empty = defaults)'),
+    timeout: int = Query(DISCOVER_TIMEOUT, ge=10, le=3600),
+    debug: bool = Query(False, description="Include extractor errors in rows"),
 ):
     src_list = [s.strip() for s in sources.split(",") if s.strip()]
     if not src_list:
@@ -239,12 +308,13 @@ async def discover(
         try:
             data = await ytdlp_playlist_json(src, extra_args=extra_args, timeout=timeout)
         except Exception as e:
+            err = {"error": str(e)[:500]} if debug else {}
             rows.append({
                 "id": "", "title": f"[DISCOVER ERROR] {src}", "url": src,
                 "uploader": "", "channel": "", "channel_id": "", "extractor": "",
                 "upload_date": None, "duration": None, "view_count": None,
                 "like_count": None, "dislike_count": None, "comment_count": None,
-                "rumbles": None, "thumbnail": "", "error": str(e)[:500]
+                "rumbles": None, "thumbnail": "", **err
             })
             continue
 
@@ -283,8 +353,9 @@ async def discover(
             "items": items,
         })
 
+
 # ──────────────────────────────────────────────────────────────────────────────
-# /download — unchanged core, callback enriched with metadata
+# /download — Rumble → mp4 → Drive upload (+callback with metadata)
 # ──────────────────────────────────────────────────────────────────────────────
 @app.post("/download", response_model=DownloadAck)
 async def download(req: DownloadReq, bg: BackgroundTasks):
@@ -300,95 +371,131 @@ async def download(req: DownloadReq, bg: BackgroundTasks):
     bg.add_task(worker_job, req, expected, target_folder)
     return DownloadAck(accepted=True, tag=req.tag, expected_name=expected, note="processing")
 
+
 async def worker_job(req: DownloadReq, expected_name: str, folder_id: str):
     started_iso = datetime.utcnow().isoformat()
     work_dir = tempfile.mkdtemp(prefix="dl_")
     temp_tpl = os.path.join(work_dir, f"{req.tag}.%(ext)s")
     out_local = os.path.join(work_dir, expected_name)
     try:
-        base_cmd = ["yt-dlp", "--no-warnings", "--newline", "-o", temp_tpl, req.url]
+        base_cmd = ["yt-dlp", "--no-warnings", "--newline", "--force-ipv4", "-o", temp_tpl, req.url]
         if req.quality == "BEST_ORIGINAL":
-            fmt = "bestvideo*+bestaudio/best"; cmd = base_cmd + ["-f", fmt, "--merge-output-format", "mp4"]
+            fmt = "bestvideo*+bestaudio/best"
+            cmd = base_cmd + ["-f", fmt, "--merge-output-format", "mp4"]
         elif req.quality == "BEST_MP4":
-            fmt = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b"; cmd = base_cmd + ["-f", fmt, "--remux-video", "mp4"]
+            fmt = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b"
+            cmd = base_cmd + ["-f", fmt, "--remux-video", "mp4"]
         else:
-            fmt = "bv*+ba/best"; cmd = base_cmd + ["-f", fmt, "--recode-video", "mp4"]
+            fmt = "bv*+ba/best"
+            cmd = base_cmd + ["-f", fmt, "--recode-video", "mp4"]
 
-        rc, so, se = await run(cmd, timeout=req.timeout or 1800)
+        rc, so, se = await run(cmd, timeout=req.timeout or DOWNLOAD_TIMEOUT)
         if rc != 0:
             await safe_callback(req.callback_url or "", {
-                "status":"error","tag": req.tag,"message": f"yt-dlp failed (rc={rc})",
-                "stdout": so[-2000:], "stderr": se[-2000:], "started_at": started_iso,
-                "completed_at": datetime.utcnow().isoformat()
-            }); return
+                "status": "error", "tag": req.tag,
+                "message": f"yt-dlp failed (rc={rc})",
+                "stdout": so[-2000:], "stderr": se[-2000:],
+                "started_at": started_iso, "completed_at": datetime.utcnow().isoformat()
+            })
+            return
 
-        files = [f for f in os.listdir(work_dir) if os.path.isfile(os.path.join(work_dir,f)) and not f.endswith(".part")]
+        # Find the downloaded media
+        files = [
+            f for f in os.listdir(work_dir)
+            if os.path.isfile(os.path.join(work_dir, f)) and not f.endswith(".part")
+        ]
         files = [f for f in files if re.search(r"\.(mp4|mkv|webm|m4a|mov|mp3)$", f, re.I)]
         if not files:
             await safe_callback(req.callback_url or "", {
-                "status":"error","tag":req.tag,"message":"Downloaded file not found",
+                "status": "error", "tag": req.tag, "message": "Downloaded file not found",
                 "started_at": started_iso, "completed_at": datetime.utcnow().isoformat()
-            }); return
+            })
+            return
         files.sort(key=lambda f: os.path.getmtime(os.path.join(work_dir, f)), reverse=True)
         dl_path = os.path.join(work_dir, files[0])
 
+        # Ensure MP4
         if not dl_path.lower().endswith(".mp4") and expected_name.lower().endswith(".mp4"):
-            rc2, _, _ = await run(["ffmpeg","-y","-i",dl_path,"-c","copy",out_local], timeout=600)
+            # Try stream copy first, then fallback to re-encode
+            rc2, _, _ = await run(["ffmpeg", "-y", "-i", dl_path, "-c", "copy", out_local], timeout=600)
             if rc2 != 0:
-                rc3, _, _ = await run(["ffmpeg","-y","-i",dl_path,"-c:v","libx264","-c:a","aac","-movflags","+faststart",out_local], timeout=3600)
+                rc3, _, _ = await run(
+                    ["ffmpeg", "-y", "-i", dl_path, "-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart", out_local],
+                    timeout=3600
+                )
                 if rc3 != 0:
                     await safe_callback(req.callback_url or "", {
-                        "status":"error","tag":req.tag,"message":"ffmpeg failed",
+                        "status": "error", "tag": req.tag, "message": "ffmpeg failed",
                         "started_at": started_iso, "completed_at": datetime.utcnow().isoformat()
-                    }); return
+                    })
+                    return
         else:
             shutil.move(dl_path, out_local)
 
+        # Upload to Drive
         up = upload_to_drive(out_local, expected_name, folder_id)
 
+        # Enriched metadata (best-effort)
         meta = {}
         try:
-            m = await get_metadata(req.url, timeout=60)
-            # build enriched meta similar to normalize_entry
-            rumble_count = m.get("rumble_count")
-            meta = {
-                "id": m.get("id"),
-                "title": m.get("title"),
-                "url": m.get("webpage_url") or m.get("url"),
-                "uploader": m.get("uploader") or m.get("channel"),
-                "channel": m.get("channel") or m.get("uploader"),
-                "channel_id": m.get("channel_id") or m.get("uploader_id"),
-                "extractor": m.get("extractor"),
-                "upload_date": m.get("upload_date"),
-                "duration": m.get("duration"),
-                "view_count": m.get("view_count"),
-                "like_count": m.get("like_count") or rumble_count,
-                "dislike_count": m.get("dislike_count"),
-                "comment_count": m.get("comment_count"),
-                "rumbles": rumble_count,
-                "thumbnail": m.get("thumbnail"),
-            }
+            # Prefer webpage_url for metadata fetch
+            rc_meta, so_meta, se_meta = await run(["yt-dlp", "--dump-json", "--no-warnings", "--force-ipv4", req.url], timeout=90)
+            if rc_meta == 0:
+                m = json.loads(next((ln for ln in so_meta.splitlines() if ln.strip().startswith("{")), "{}"))
+                rumble_count = m.get("rumble_count")
+                meta = {
+                    "id": m.get("id"),
+                    "title": m.get("title"),
+                    "url": m.get("webpage_url") or m.get("url"),
+                    "uploader": m.get("uploader") or m.get("channel"),
+                    "channel": m.get("channel") or m.get("uploader"),
+                    "channel_id": m.get("channel_id") or m.get("uploader_id"),
+                    "extractor": m.get("extractor"),
+                    "upload_date": m.get("upload_date"),
+                    "duration": m.get("duration"),
+                    "view_count": m.get("view_count"),
+                    "like_count": m.get("like_count") or rumble_count,
+                    "dislike_count": m.get("dislike_count"),
+                    "comment_count": m.get("comment_count"),
+                    "rumbles": rumble_count,
+                    "thumbnail": m.get("thumbnail"),
+                }
+            else:
+                meta = {"_meta_error": (se_meta or "")[-300:]}
         except Exception as _e:
             meta = {"_meta_error": str(_e)[:200]}
 
         if DELETE_LOCAL_AFTER_UPLOAD and os.path.exists(out_local):
-            try: os.remove(out_local)
-            except Exception: pass
+            try:
+                os.remove(out_local)
+            except Exception:
+                pass
 
         await safe_callback(req.callback_url or "", {
-            "status":"done","tag":req.tag,"expected_name":expected_name,
-            "drive_file_id": up["file_id"], "drive_link": up["drive_link"],
-            "metadata": meta, "started_at": started_iso, "completed_at": datetime.utcnow().isoformat()
+            "status": "done",
+            "tag": req.tag,
+            "expected_name": expected_name,
+            "drive_file_id": up["file_id"],
+            "drive_link": up["drive_link"],
+            "metadata": meta,
+            "started_at": started_iso,
+            "completed_at": datetime.utcnow().isoformat()
         })
 
     except Exception as e:
         await safe_callback(req.callback_url or "", {
-            "status":"error","tag":req.tag,"message":str(e),
-            "started_at": started_iso, "completed_at": datetime.utcnow().isoformat()
+            "status": "error",
+            "tag": req.tag,
+            "message": str(e),
+            "started_at": started_iso,
+            "completed_at": datetime.utcnow().isoformat()
         })
     finally:
-        try: shutil.rmtree(work_dir, ignore_errors=True)
-        except Exception: pass
+        try:
+            shutil.rmtree(work_dir, ignore_errors=True)
+        except Exception:
+            pass
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
