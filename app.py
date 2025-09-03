@@ -1,15 +1,17 @@
 import os, re, json, asyncio, shutil, tempfile, uuid, pathlib, time, threading, base64
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional, Literal, List, Dict, Any
 
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Header, Query, Request
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Header, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 import httpx
 import uvicorn
 
-# ============== Config ==============
+# =========================
+# Config
+# =========================
 APP_PORT = int(os.getenv("PORT", "8000"))
 
 # Destination selection
@@ -19,25 +21,34 @@ DEFAULT_DEST = (os.getenv("DEFAULT_DEST") or "LOCAL").upper()  # "LOCAL" or "DRI
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").rstrip("/")
 PUBLIC_FILES_DIR = os.getenv("PUBLIC_FILES_DIR", "/data/public")
 os.makedirs(PUBLIC_FILES_DIR, exist_ok=True)
-ONCE_TOKEN_TTL_SEC = int(os.getenv("ONCE_TOKEN_TTL_SEC", "86400"))  # if never downloaded
+
+# Single-use token TTL (if nobody downloads within this TTL, file is deleted)
+ONCE_TOKEN_TTL_SEC = int(os.getenv("ONCE_TOKEN_TTL_SEC", "86400"))
 DELETE_AFTER_SERVE = (os.getenv("DELETE_AFTER_SERVE", "true").lower() == "true")
 
-# Drive config (optional)
+# Google Drive (optional)
 DRIVE_ENABLED = (os.getenv("DRIVE_ENABLED") or ("oauth" if os.getenv("GOOGLE_REFRESH_TOKEN") else "")).lower() in ("oauth","service")
 DRIVE_AUTH = (os.getenv("DRIVE_AUTH") or "oauth").lower()  # "oauth" | "service"
 DRIVE_FOLDER_ID_DEFAULT = (os.getenv("DRIVE_FOLDER_ID") or "").strip() or None
 DRIVE_PUBLIC = (os.getenv("DRIVE_PUBLIC") or "false").lower() == "true"
 
-# Timeouts / quality
+# Timeouts
 DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT_SEC") or 5400)
 
-# ============== State ==============
-# Single-use tokens: token -> { path, size, active, consumed, last_seen, expiry, tag }
+# =========================
+# In-memory registries
+# =========================
+# Single-use token registry: token -> meta
+# meta: { path, size, active, consumed, last_seen, expiry, tag }
 ONCE_TOKENS: Dict[str, Dict[str, Any]] = {}
-# Jobs: tag -> {status, payload, updated_at}
+
+# Job status registry: tag -> {status, payload, updated_at, dest, expected_name}
+# status: queued | downloading | ready | error
 JOBS: Dict[str, Dict[str, Any]] = {}
 
-# ============== Utils ==============
+# =========================
+# Utils
+# =========================
 def sanitize_filename(name: str) -> str:
     safe = re.sub(r"[^a-zA-Z0-9._-]", "_", name)
     return safe.strip(" .")
@@ -60,6 +71,7 @@ async def safe_callback(url: str, payload: dict):
         async with httpx.AsyncClient(timeout=15) as client:
             await client.post(url, json=payload)
     except Exception:
+        # best effort only
         pass
 
 def job_set(tag: str, **kw):
@@ -68,14 +80,16 @@ def job_set(tag: str, **kw):
     rec["updated_at"] = datetime.utcnow().isoformat()
     JOBS[tag] = rec
 
-# ============== Single-use (LOCAL) helpers ==============
+# =========================
+# Single-use link helpers (LOCAL)
+# =========================
 def _file_stat(path: str) -> tuple[int, str]:
     p = pathlib.Path(path)
     if not p.exists() or not p.is_file():
         raise FileNotFoundError
     return (p.stat().st_size, p.name)
 
-def build_once_url(token: str) -> str:
+def _build_once_url(token: str) -> str:
     if not PUBLIC_BASE_URL:
         return f"/once/{token}"
     return f"{PUBLIC_BASE_URL}/once/{token}"
@@ -87,13 +101,13 @@ def make_single_use_url(filename: str, tag: str) -> str:
     ONCE_TOKENS[token] = {
         "path": path,
         "size": size,
-        "active": 0,
-        "consumed": False,
+        "active": 0,         # concurrent streams
+        "consumed": False,   # true once any bytes were sent
         "last_seen": time.time(),
         "expiry": time.time() + ONCE_TOKEN_TTL_SEC,
         "tag": tag,
     }
-    return build_once_url(token)
+    return _build_once_url(token)
 
 def _maybe_delete_and_purge(token: str):
     meta = ONCE_TOKENS.get(token)
@@ -102,7 +116,8 @@ def _maybe_delete_and_purge(token: str):
         try:
             if os.path.exists(meta["path"]):
                 os.remove(meta["path"])
-        except Exception: pass
+        except Exception:
+            pass
         ONCE_TOKENS.pop(token, None)
 
 def _janitor_loop():
@@ -121,9 +136,12 @@ def _janitor_loop():
         except Exception:
             pass
         time.sleep(60)
+
 threading.Thread(target=_janitor_loop, daemon=True).start()
 
-# ============== Google Drive (optional) ==============
+# =========================
+# Google Drive (optional)
+# =========================
 _drive_service = None
 def _build_drive():
     global _drive_service
@@ -173,7 +191,9 @@ def drive_upload(local_path: str, out_name: str, folder_id: Optional[str]) -> di
         svc.permissions().create(fileId=file["id"], body={"role": "reader", "type": "anyone"}).execute()
     return {"file_id": file["id"], "webViewLink": file.get("webViewLink")}
 
-# ============== FastAPI app ==============
+# =========================
+# FastAPI app
+# =========================
 app = FastAPI()
 
 @app.get("/")
@@ -191,7 +211,9 @@ def root():
 def healthz():
     return {"ok": True}
 
-# ===== Models =====
+# =========================
+# Models
+# =========================
 class DownloadReq(BaseModel):
     url: str
     tag: Optional[str] = Field(default_factory=lambda: f"job_{uuid.uuid4().hex[:8]}")
@@ -201,6 +223,10 @@ class DownloadReq(BaseModel):
     timeout: Optional[int] = DOWNLOAD_TIMEOUT
     dest: Optional[Literal["LOCAL","DRIVE"]] = None
     drive_folder: Optional[str] = None
+    # hardening knobs
+    retries: Optional[int] = 3            # times per strategy
+    socket_timeout: Optional[int] = 30    # yt-dlp --socket-timeout
+    prefer_api: Optional[bool] = True     # try rumble:use_api first
 
 class DownloadAck(BaseModel):
     accepted: bool
@@ -208,33 +234,38 @@ class DownloadAck(BaseModel):
     expected_name: Optional[str]
     note: str
 
-# ===== Routes =====
+# =========================
+# Routes
+# =========================
 @app.post("/download", response_model=DownloadAck)
 async def download(req: DownloadReq, bg: BackgroundTasks):
     if not req.url or not isinstance(req.url, str):
         raise HTTPException(status_code=400, detail="Missing url")
+
     # resolve filename
     expected = req.expected_name or f"{req.tag}.mp4"
     expected = sanitize_filename(expected)
     if not expected.lower().endswith(".mp4"):
         expected += ".mp4"
+
     # pick destination
     dest = (req.dest or DEFAULT_DEST).upper()
     if dest == "DRIVE" and not DRIVE_ENABLED:
         raise HTTPException(status_code=400, detail="Drive not configured; use LOCAL or enable Drive")
+
     job_set(req.tag, status="queued", expected_name=expected, dest=dest)
     bg.add_task(worker_job, req, expected, dest)
     return DownloadAck(accepted=True, tag=req.tag, expected_name=expected, note="processing")
 
 @app.get("/status")
-def status(tag: str = Query(...)):
+def get_status(tag: str = Query(...)):
     rec = JOBS.get(tag)
     if not rec:
         return JSONResponse({"tag": tag, "status": "unknown"}, status_code=404)
     return {"tag": tag, "status": rec.get("status"), "dest": rec.get("dest")}
 
 @app.get("/result")
-def result(tag: str = Query(...)):
+def get_result(tag: str = Query(...)):
     rec = JOBS.get(tag)
     if not rec:
         return JSONResponse({"tag": tag, "status": "unknown"}, status_code=404)
@@ -244,14 +275,18 @@ def result(tag: str = Query(...)):
         return JSONResponse({"tag": tag, "status": "ready", **payload}, status_code=200)
     if st == "error":
         return JSONResponse({"tag": tag, "status": "error", "error_message": payload.get("error_message","unknown")}, status_code=500)
-    # queued/downloading
     return JSONResponse({"tag": tag, "status": st or "queued"}, status_code=202)
 
 @app.get("/once/{token}")
-def serve_once(token: str, range_header: Optional[str] = Header(default=None, alias="Range")):
+def serve_single_use(token: str, range_header: Optional[str] = Header(default=None, alias="Range")):
+    """
+    Streams the file ONCE (supports Range). After all concurrent streams finish,
+    the file is deleted and the token is invalidated.
+    """
     meta = ONCE_TOKENS.get(token)
     if not meta:
         raise HTTPException(status_code=404, detail="Expired or invalid link")
+
     path = meta["path"]
     if not os.path.exists(path):
         ONCE_TOKENS.pop(token, None)
@@ -260,6 +295,7 @@ def serve_once(token: str, range_header: Optional[str] = Header(default=None, al
     size = meta["size"]
     meta["last_seen"] = time.time()
 
+    # defaults
     start, end = 0, size - 1
     status_code = 200
     headers = {
@@ -268,6 +304,8 @@ def serve_once(token: str, range_header: Optional[str] = Header(default=None, al
         "Content-Disposition": f'inline; filename="{pathlib.Path(path).name}"',
         "Content-Type": "video/mp4",
     }
+
+    # Range parsing
     if range_header and size > 0:
         try:
             _, rng = range_header.split("=")
@@ -289,26 +327,31 @@ def serve_once(token: str, range_header: Optional[str] = Header(default=None, al
     meta["active"] += 1
 
     def file_iter():
-        emitted = False
+        emitted_any = False
         try:
             with open(path, "rb") as f:
                 f.seek(start)
                 remaining = end - start + 1
-                chunk = 1024 * 1024
+                chunk = 1024 * 1024  # 1 MiB
                 while remaining > 0:
                     data = f.read(min(chunk, remaining))
-                    if not data: break
-                    emitted = True
+                    if not data:
+                        break
+                    emitted_any = True
                     yield data
                     remaining -= len(data)
         finally:
             meta["active"] -= 1
-            if emitted: meta["consumed"] = True
-            if DELETE_AFTER_SERVE: _maybe_delete_and_purge(token)
+            if emitted_any:
+                meta["consumed"] = True
+            if DELETE_AFTER_SERVE:
+                _maybe_delete_and_purge(token)
 
     return StreamingResponse(file_iter(), status_code=status_code, headers=headers)
 
-# ===== Worker =====
+# =========================
+# Worker
+# =========================
 async def worker_job(req: DownloadReq, expected_name: str, dest: str):
     started_iso = datetime.utcnow().isoformat()
     work_dir = tempfile.mkdtemp(prefix="dl_")
@@ -317,56 +360,107 @@ async def worker_job(req: DownloadReq, expected_name: str, dest: str):
 
     try:
         job_set(req.tag, status="downloading", dest=dest)
-        # yt-dlp cmd
-        base = ["yt-dlp", "--no-warnings", "--newline", "--force-ipv4", "-o", temp_tpl, req.url]
-        if req.quality == "BEST_ORIGINAL":
-            cmd = base + ["-f", "bestvideo*+bestaudio/best", "--merge-output-format", "mp4"]
-        elif req.quality == "BEST_MP4":
-            cmd = base + ["-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b", "--remux-video", "mp4"]
-        else:
-            cmd = base + ["-f", "bv*+ba/best", "--recode-video", "mp4"]
 
-        rc, so, se = await run(cmd, timeout=req.timeout or DOWNLOAD_TIMEOUT)
-        if rc != 0:
-            err = f"yt-dlp failed (rc={rc})\n{(se or '')[-1500:]}"
+        # ---------- Hardened yt-dlp with fallbacks ----------
+        sock_to = int(req.socket_timeout or 30)
+        overall_to = int(req.timeout or DOWNLOAD_TIMEOUT)
+
+        def build_quality_flags(mode: str) -> List[str]:
+            if mode == "BEST_ORIGINAL":
+                return ["-f", "bestvideo*+bestaudio/best", "--merge-output-format", "mp4"]
+            if mode == "BEST_MP4":
+                return ["-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b", "--remux-video", "mp4"]
+            return ["-f", "bv*+ba/best", "--recode-video", "mp4"]  # STRICT_MP4_REENC
+
+        common = [
+            "yt-dlp",
+            "--no-warnings",
+            "--ignore-errors",
+            "--force-ipv4",
+            "--socket-timeout", str(sock_to),
+            "--retries", "10",
+            "--fragment-retries", "50",
+            "--concurrent-fragments", "10",
+            "-o", temp_tpl,
+            req.url,
+        ]
+        common_ua = common + ["--user-agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"]
+        qual_flags = build_quality_flags(req.quality)
+
+        strategies: List[List[str]] = []
+        if bool(req.prefer_api):
+            strategies.append(common_ua + ["--extractor-args", "rumble:use_api=1"] + qual_flags)
+        strategies.append(common_ua + qual_flags)
+        if req.quality != "STRICT_MP4_REENC":
+            strategies.append(common_ua + build_quality_flags("STRICT_MP4_REENC"))
+
+        attempts = int(req.retries or 3)
+        last_rc, last_se = None, ""
+        success = False
+        for strat_idx, strat_cmd in enumerate(strategies):
+            for attempt in range(1, attempts + 1):
+                rc, so, se = await run(strat_cmd, timeout=overall_to)
+                if rc == 0:
+                    success = True
+                    break
+                last_rc, last_se = rc, se
+                await asyncio.sleep(4 * attempt)  # 4s, 8s, 12s...
+            if success:
+                break
+
+        if not success:
+            err = f"yt-dlp failed (last rc={last_rc})\n{(last_se or '')[-1500:]}"
             job_set(req.tag, status="error", payload={"error_message": err})
-            await safe_callback(req.callback_url or "", {"status":"error","tag":req.tag,"error_message":err,"started_at":started_iso,"completed_at":datetime.utcnow().isoformat()})
+            await safe_callback(req.callback_url or "", {
+                "status":"error","tag":req.tag,"error_message":err,
+                "started_at": started_iso, "completed_at": datetime.utcnow().isoformat()
+            })
             return
 
-        files = [f for f in os.listdir(work_dir) if os.path.isfile(os.path.join(work_dir, f)) and not f.endswith(".part")]
+        # ---------- Pick newest finished media ----------
+        files = [
+            f for f in os.listdir(work_dir)
+            if os.path.isfile(os.path.join(work_dir, f)) and not f.endswith(".part")
+        ]
         files = [f for f in files if re.search(r"\.(mp4|mkv|webm|m4a|mov|mp3)$", f, re.I)]
         if not files:
             err = "no media file produced"
             job_set(req.tag, status="error", payload={"error_message": err})
-            await safe_callback(req.callback_url or "", {"status":"error","tag":req.tag,"error_message":err,"started_at":started_iso,"completed_at":datetime.utcnow().isoformat()})
+            await safe_callback(req.callback_url or "", {
+                "status":"error","tag":req.tag,"error_message":err,
+                "started_at": started_iso, "completed_at": datetime.utcnow().isoformat()
+            })
             return
+
         files.sort(key=lambda f: os.path.getmtime(os.path.join(work_dir, f)), reverse=True)
         src = os.path.join(work_dir, files[0])
 
-        # ensure mp4 if expected ends with .mp4
+        # ---------- Normalize to mp4 if needed ----------
         if not src.lower().endswith(".mp4") and expected_name.lower().endswith(".mp4"):
             rc2, _, _ = await run(["ffmpeg", "-y", "-i", src, "-c", "copy", out_local], timeout=600)
             if rc2 != 0:
                 rc3, _, _ = await run(
                     ["ffmpeg", "-y", "-i", src, "-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart", out_local],
-                    timeout=max(1800, req.timeout or DOWNLOAD_TIMEOUT)
+                    timeout=max(1800, overall_to)
                 )
                 if rc3 != 0:
                     err = "ffmpeg failed"
                     job_set(req.tag, status="error", payload={"error_message": err})
-                    await safe_callback(req.callback_url or "", {"status":"error","tag":req.tag,"error_message":err,"started_at":started_iso,"completed_at":datetime.utcnow().isoformat()})
+                    await safe_callback(req.callback_url or "", {
+                        "status":"error","tag":req.tag,"error_message":err,
+                        "started_at": started_iso, "completed_at": datetime.utcnow().isoformat()
+                    })
                     return
         else:
             shutil.move(src, out_local)
 
+        # ---------- Deliver ----------
         if dest == "DRIVE":
-            # Upload to Drive
             try:
                 folder_id = req.drive_folder or DRIVE_FOLDER_ID_DEFAULT
                 if not folder_id:
                     raise RuntimeError("DRIVE_FOLDER_ID missing")
                 up = drive_upload(out_local, expected_name, folder_id)
-                # success payload
                 payload = {
                     "tag": req.tag,
                     "expected_name": expected_name,
@@ -376,13 +470,14 @@ async def worker_job(req: DownloadReq, expected_name: str, dest: str):
                     "dest": "DRIVE",
                 }
                 job_set(req.tag, status="ready", payload=payload)
-                await safe_callback(req.callback_url or "", {"status":"ready", **payload, "started_at":started_iso, "completed_at":datetime.utcnow().isoformat()})
+                await safe_callback(req.callback_url or "", {
+                    "status":"ready", **payload,
+                    "started_at": started_iso, "completed_at": datetime.utcnow().isoformat()
+                })
             finally:
-                # always remove local temp
                 try: os.remove(out_local)
                 except Exception: pass
         else:
-            # LOCAL single-use link
             public_path = os.path.join(PUBLIC_FILES_DIR, expected_name)
             shutil.move(out_local, public_path)
             once_url = make_single_use_url(os.path.basename(public_path), tag=req.tag)
@@ -395,16 +490,24 @@ async def worker_job(req: DownloadReq, expected_name: str, dest: str):
                 "dest": "LOCAL",
             }
             job_set(req.tag, status="ready", payload=payload)
-            await safe_callback(req.callback_url or "", {"status":"ready", **payload, "started_at":started_iso, "completed_at":datetime.utcnow().isoformat()})
+            await safe_callback(req.callback_url or "", {
+                "status":"ready", **payload,
+                "started_at": started_iso, "completed_at": datetime.utcnow().isoformat()
+            })
 
     except Exception as e:
         err = str(e)
         job_set(req.tag, status="error", payload={"error_message": err})
-        await safe_callback(req.callback_url or "", {"status":"error","tag":req.tag,"error_message":err,"started_at":started_iso,"completed_at":datetime.utcnow().isoformat()})
+        await safe_callback(req.callback_url or "", {
+            "status":"error","tag":req.tag,"error_message":err,
+            "started_at": started_iso, "completed_at": datetime.utcnow().isoformat()
+        })
     finally:
         try: shutil.rmtree(work_dir, ignore_errors=True)
         except Exception: pass
 
-# ============== Main ==============
+# =========================
+# Main
+# =========================
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=APP_PORT, reload=False)
