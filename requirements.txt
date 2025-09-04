@@ -7,3 +7,21 @@ google-auth==2.33.0
 google-auth-httplib2==0.2.0
 google-auth-oauthlib==1.2.1
 yt-dlp==2025.08.27
+
+# Security & Rate Limiting
+slowapi==0.1.9
+python-multipart==0.0.9
+
+# Observability & Logging
+loguru==0.7.2
+prometheus-client==0.21.0
+
+# Development & Testing
+pytest==8.3.3
+pytest-asyncio==0.24.0
+pytest-httpx==0.30.0
+pytest-cov==5.0.0
+black==24.8.0
+isort==5.13.2
+flake8==7.1.1
+pre-commit==3.8.0
