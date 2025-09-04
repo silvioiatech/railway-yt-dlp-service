@@ -2,10 +2,30 @@
 __pycache__/
 *.pyc
 .venv/
+venv/
+*.egg-info/
 
 # Local creds / env
 client_secret.json
 *.env
 
+# Logs and temporary files
+logs/
+*.log
+.pytest_cache/
+.coverage
+htmlcov/
+
 # OS
 .DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Testing
+coverage.xml
+.tox/
