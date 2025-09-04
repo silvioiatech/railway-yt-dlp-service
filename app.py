@@ -2,9 +2,17 @@ import os, re, json, asyncio, shutil, tempfile, uuid, pathlib, time, threading, 
 from datetime import datetime
 from typing import Optional, Literal, List, Dict, Any
 
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Header, Query
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Header, Query, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from loguru import logger
+import sys
 
 import httpx
 import uvicorn
@@ -13,6 +21,11 @@ import uvicorn
 # Config
 # =========================
 APP_PORT = int(os.getenv("PORT", "8000"))
+
+# Security configuration
+API_KEY = os.getenv("API_KEY", "")  # Optional API key protection
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
+RATE_LIMIT_REQUESTS = os.getenv("RATE_LIMIT_REQUESTS", "30/minute")
 
 # Destination selection
 DEFAULT_DEST = (os.getenv("DEFAULT_DEST") or "LOCAL").upper()  # "LOCAL" or "DRIVE"
@@ -34,6 +47,51 @@ DRIVE_PUBLIC = (os.getenv("DRIVE_PUBLIC") or "false").lower() == "true"
 
 # Timeouts
 DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT_SEC") or 5400)
+
+# =========================
+# Logging Configuration
+# =========================
+logger.remove()  # Remove default handler
+logger.add(
+    sys.stdout,
+    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    serialize=False,
+)
+logger.add(
+    "logs/app.log",
+    format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    rotation="100 MB",
+    retention="7 days",
+    compression="zip",
+)
+
+# Create logs directory
+os.makedirs("logs", exist_ok=True)
+
+# =========================
+# Rate Limiting Setup
+# =========================
+limiter = Limiter(key_func=get_remote_address)
+
+# =========================
+# Security
+# =========================
+security = HTTPBearer(auto_error=False)
+
+async def verify_api_key(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
+    """Optional API key verification"""
+    if not API_KEY:
+        return True  # No API key required
+    
+    if not credentials:
+        raise HTTPException(status_code=401, detail="API key required")
+    
+    if credentials.credentials != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    return True
 
 # =========================
 # In-memory registries
@@ -194,22 +252,122 @@ def drive_upload(local_path: str, out_name: str, folder_id: Optional[str]) -> di
 # =========================
 # FastAPI app
 # =========================
-app = FastAPI()
+app = FastAPI(
+    title="Railway yt-dlp Service",
+    description="A FastAPI service for downloading media using yt-dlp with Google Drive integration",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Add rate limiting middleware
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
+
+# Security headers middleware
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return response
+
+# Request logging middleware
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start_time = time.time()
+    logger.info(f"Request: {request.method} {request.url}")
+    
+    response = await call_next(request)
+    
+    process_time = time.time() - start_time
+    logger.info(f"Response: {response.status_code} - {process_time:.3f}s")
+    return response
 
 @app.get("/")
 def root():
     return {
         "ok": True,
+        "service": "Railway yt-dlp Service",
+        "version": "1.0.0",
         "default_dest": DEFAULT_DEST,
         "drive_enabled": DRIVE_ENABLED,
         "public_base_url": PUBLIC_BASE_URL or "(unset)",
         "public_files_dir": PUBLIC_FILES_DIR,
+        "rate_limit": RATE_LIMIT_REQUESTS,
+        "api_key_required": bool(API_KEY),
         "time": datetime.utcnow().isoformat(),
     }
 
 @app.get("/healthz")
-def healthz():
-    return {"ok": True}
+@limiter.limit("60/minute")
+def healthz(request: Request):
+    """Enhanced health check endpoint"""
+    try:
+        # Check critical dependencies
+        health_status = {
+            "status": "healthy",
+            "timestamp": datetime.utcnow().isoformat(),
+            "version": "1.0.0",
+            "checks": {
+                "storage": "healthy" if os.path.exists(PUBLIC_FILES_DIR) else "unhealthy",
+                "drive": "enabled" if DRIVE_ENABLED else "disabled",
+                "memory": "healthy",  # Could add actual memory check
+            }
+        }
+        
+        # Check if any critical checks failed
+        if any(check == "unhealthy" for check in health_status["checks"].values() if check != "disabled"):
+            health_status["status"] = "unhealthy"
+            return JSONResponse(health_status, status_code=503)
+            
+        return health_status
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return JSONResponse({
+            "status": "unhealthy",
+            "error": str(e),
+            "timestamp": datetime.utcnow().isoformat()
+        }, status_code=503)
+
+@app.get("/metrics")
+@limiter.limit("30/minute")
+def metrics(request: Request):
+    """Basic metrics endpoint for monitoring"""
+    try:
+        from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+        return StreamingResponse(
+            iter([generate_latest()]), 
+            media_type=CONTENT_TYPE_LATEST
+        )
+    except ImportError:
+        # Fallback metrics if prometheus client not available
+        return {
+            "jobs": {
+                "total": len(JOBS),
+                "by_status": {
+                    status: len([j for j in JOBS.values() if j.get("status") == status])
+                    for status in ["queued", "downloading", "ready", "error"]
+                }
+            },
+            "tokens": {
+                "active": len(ONCE_TOKENS),
+                "consumed": len([t for t in ONCE_TOKENS.values() if t.get("consumed", False)])
+            },
+            "timestamp": datetime.utcnow().isoformat()
+        }
 
 # =========================
 # Models
@@ -238,7 +396,11 @@ class DownloadAck(BaseModel):
 # Routes
 # =========================
 @app.post("/download", response_model=DownloadAck)
-async def download(req: DownloadReq, bg: BackgroundTasks):
+@limiter.limit("10/minute")
+async def download(request: Request, req: DownloadReq, bg: BackgroundTasks, _: bool = Depends(verify_api_key)):
+    """Download media from URL"""
+    logger.info(f"Download request: {req.url} with tag {req.tag}")
+    
     if not req.url or not isinstance(req.url, str):
         raise HTTPException(status_code=400, detail="Missing url")
 
@@ -255,17 +417,23 @@ async def download(req: DownloadReq, bg: BackgroundTasks):
 
     job_set(req.tag, status="queued", expected_name=expected, dest=dest)
     bg.add_task(worker_job, req, expected, dest)
+    
+    logger.info(f"Download job queued: {req.tag}")
     return DownloadAck(accepted=True, tag=req.tag, expected_name=expected, note="processing")
 
 @app.get("/status")
-def get_status(tag: str = Query(...)):
+@limiter.limit("60/minute")
+def get_status(request: Request, tag: str = Query(...)):
+    """Get download job status"""
     rec = JOBS.get(tag)
     if not rec:
         return JSONResponse({"tag": tag, "status": "unknown"}, status_code=404)
     return {"tag": tag, "status": rec.get("status"), "dest": rec.get("dest")}
 
 @app.get("/result")
-def get_result(tag: str = Query(...)):
+@limiter.limit("30/minute")
+def get_result(request: Request, tag: str = Query(...)):
+    """Get download job result"""
     rec = JOBS.get(tag)
     if not rec:
         return JSONResponse({"tag": tag, "status": "unknown"}, status_code=404)
@@ -278,11 +446,14 @@ def get_result(tag: str = Query(...)):
     return JSONResponse({"tag": tag, "status": st or "queued"}, status_code=202)
 
 @app.get("/once/{token}")
-def serve_single_use(token: str, range_header: Optional[str] = Header(default=None, alias="Range")):
+@limiter.limit("30/minute")
+def serve_single_use(request: Request, token: str, range_header: Optional[str] = Header(default=None, alias="Range")):
     """
     Streams the file ONCE (supports Range). After all concurrent streams finish,
     the file is deleted and the token is invalidated.
     """
+    logger.info(f"Serving single-use file with token: {token}")
+    
     meta = ONCE_TOKENS.get(token)
     if not meta:
         raise HTTPException(status_code=404, detail="Expired or invalid link")
@@ -346,6 +517,7 @@ def serve_single_use(token: str, range_header: Optional[str] = Header(default=No
                 meta["consumed"] = True
             if DELETE_AFTER_SERVE:
                 _maybe_delete_and_purge(token)
+            logger.info(f"File streaming completed for token: {token}")
 
     return StreamingResponse(file_iter(), status_code=status_code, headers=headers)
 
@@ -353,10 +525,13 @@ def serve_single_use(token: str, range_header: Optional[str] = Header(default=No
 # Worker
 # =========================
 async def worker_job(req: DownloadReq, expected_name: str, dest: str):
+    """Enhanced worker job with logging"""
     started_iso = datetime.utcnow().isoformat()
     work_dir = tempfile.mkdtemp(prefix="dl_")
     temp_tpl = os.path.join(work_dir, f"{req.tag}.%(ext)s")
     out_local = os.path.join(work_dir, expected_name)
+
+    logger.info(f"Starting download job {req.tag}: {req.url}")
 
     try:
         job_set(req.tag, status="downloading", dest=dest)
@@ -397,19 +572,27 @@ async def worker_job(req: DownloadReq, expected_name: str, dest: str):
         attempts = int(req.retries or 3)
         last_rc, last_se = None, ""
         success = False
+        
+        logger.info(f"Job {req.tag}: Trying {len(strategies)} strategies with {attempts} attempts each")
+        
         for strat_idx, strat_cmd in enumerate(strategies):
+            logger.info(f"Job {req.tag}: Strategy {strat_idx + 1}/{len(strategies)}")
             for attempt in range(1, attempts + 1):
+                logger.info(f"Job {req.tag}: Attempt {attempt}/{attempts}")
                 rc, so, se = await run(strat_cmd, timeout=overall_to)
                 if rc == 0:
                     success = True
+                    logger.info(f"Job {req.tag}: Download successful on strategy {strat_idx + 1}, attempt {attempt}")
                     break
                 last_rc, last_se = rc, se
+                logger.warning(f"Job {req.tag}: Attempt {attempt} failed with rc={rc}")
                 await asyncio.sleep(4 * attempt)  # 4s, 8s, 12s...
             if success:
                 break
 
         if not success:
             err = f"yt-dlp failed (last rc={last_rc})\n{(last_se or '')[-1500:]}"
+            logger.error(f"Job {req.tag}: {err}")
             job_set(req.tag, status="error", payload={"error_message": err})
             await safe_callback(req.callback_url or "", {
                 "status":"error","tag":req.tag,"error_message":err,
@@ -425,6 +608,7 @@ async def worker_job(req: DownloadReq, expected_name: str, dest: str):
         files = [f for f in files if re.search(r"\.(mp4|mkv|webm|m4a|mov|mp3)$", f, re.I)]
         if not files:
             err = "no media file produced"
+            logger.error(f"Job {req.tag}: {err}")
             job_set(req.tag, status="error", payload={"error_message": err})
             await safe_callback(req.callback_url or "", {
                 "status":"error","tag":req.tag,"error_message":err,
@@ -434,17 +618,21 @@ async def worker_job(req: DownloadReq, expected_name: str, dest: str):
 
         files.sort(key=lambda f: os.path.getmtime(os.path.join(work_dir, f)), reverse=True)
         src = os.path.join(work_dir, files[0])
+        logger.info(f"Job {req.tag}: Selected file: {files[0]}")
 
         # ---------- Normalize to mp4 if needed ----------
         if not src.lower().endswith(".mp4") and expected_name.lower().endswith(".mp4"):
+            logger.info(f"Job {req.tag}: Converting to mp4")
             rc2, _, _ = await run(["ffmpeg", "-y", "-i", src, "-c", "copy", out_local], timeout=600)
             if rc2 != 0:
+                logger.warning(f"Job {req.tag}: Copy failed, trying re-encode")
                 rc3, _, _ = await run(
                     ["ffmpeg", "-y", "-i", src, "-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart", out_local],
                     timeout=max(1800, overall_to)
                 )
                 if rc3 != 0:
                     err = "ffmpeg failed"
+                    logger.error(f"Job {req.tag}: {err}")
                     job_set(req.tag, status="error", payload={"error_message": err})
                     await safe_callback(req.callback_url or "", {
                         "status":"error","tag":req.tag,"error_message":err,
@@ -456,6 +644,7 @@ async def worker_job(req: DownloadReq, expected_name: str, dest: str):
 
         # ---------- Deliver ----------
         if dest == "DRIVE":
+            logger.info(f"Job {req.tag}: Uploading to Google Drive")
             try:
                 folder_id = req.drive_folder or DRIVE_FOLDER_ID_DEFAULT
                 if not folder_id:
@@ -470,6 +659,7 @@ async def worker_job(req: DownloadReq, expected_name: str, dest: str):
                     "dest": "DRIVE",
                 }
                 job_set(req.tag, status="ready", payload=payload)
+                logger.info(f"Job {req.tag}: Successfully uploaded to Drive: {up['file_id']}")
                 await safe_callback(req.callback_url or "", {
                     "status":"ready", **payload,
                     "started_at": started_iso, "completed_at": datetime.utcnow().isoformat()
@@ -478,6 +668,7 @@ async def worker_job(req: DownloadReq, expected_name: str, dest: str):
                 try: os.remove(out_local)
                 except Exception: pass
         else:
+            logger.info(f"Job {req.tag}: Saving to local storage")
             public_path = os.path.join(PUBLIC_FILES_DIR, expected_name)
             shutil.move(out_local, public_path)
             once_url = make_single_use_url(os.path.basename(public_path), tag=req.tag)
@@ -490,6 +681,7 @@ async def worker_job(req: DownloadReq, expected_name: str, dest: str):
                 "dest": "LOCAL",
             }
             job_set(req.tag, status="ready", payload=payload)
+            logger.info(f"Job {req.tag}: File ready at {once_url}")
             await safe_callback(req.callback_url or "", {
                 "status":"ready", **payload,
                 "started_at": started_iso, "completed_at": datetime.utcnow().isoformat()
@@ -497,6 +689,7 @@ async def worker_job(req: DownloadReq, expected_name: str, dest: str):
 
     except Exception as e:
         err = str(e)
+        logger.error(f"Job {req.tag}: Unexpected error: {err}")
         job_set(req.tag, status="error", payload={"error_message": err})
         await safe_callback(req.callback_url or "", {
             "status":"error","tag":req.tag,"error_message":err,

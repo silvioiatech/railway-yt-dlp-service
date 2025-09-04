@@ -1,0 +1,16 @@
+2025-09-04 01:30:59 | INFO     | app:log_requests:291 - Request: GET http://localhost:8000/
+2025-09-04 01:30:59 | INFO     | app:log_requests:296 - Response: 200 - 0.002s
+2025-09-04 01:31:04 | INFO     | app:log_requests:291 - Request: GET http://localhost:8000/healthz
+2025-09-04 01:31:04 | INFO     | app:log_requests:296 - Response: 200 - 0.001s
+2025-09-04 01:31:10 | INFO     | app:log_requests:291 - Request: GET http://localhost:8000/metrics
+2025-09-04 01:31:10 | INFO     | app:log_requests:296 - Response: 200 - 0.015s
+2025-09-04 01:31:16 | INFO     | app:log_requests:291 - Request: GET http://localhost:8000/metrics
+2025-09-04 01:31:16 | INFO     | app:log_requests:296 - Response: 200 - 0.002s
+2025-09-04 01:31:23 | INFO     | app:log_requests:291 - Request: HEAD http://localhost:8000/docs
+2025-09-04 01:31:23 | INFO     | app:log_requests:296 - Response: 200 - 0.001s
+2025-09-04 01:36:08 | ERROR    | app:worker_job:595 - Job test-job-123: yt-dlp failed (last rc=1)
+ERROR: [generic] Unable to download webpage: [Errno -5] No address associated with hostname (caused by TransportError('[Errno -5] No address associated with hostname'))
+
+2025-09-04 01:37:26 | ERROR    | app:worker_job:595 - Job job_e8f99caa: yt-dlp failed (last rc=1)
+ERROR: [generic] Unable to download webpage: [Errno -5] No address associated with hostname (caused by TransportError('[Errno -5] No address associated with hostname'))
+
