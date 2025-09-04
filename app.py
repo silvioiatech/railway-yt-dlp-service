@@ -1,21 +1,32 @@
-import os, re, json, asyncio, shutil, tempfile, uuid, pathlib, time, threading, base64
-from datetime import datetime
-from typing import Optional, Literal, List, Dict, Any
-
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Header, Query, Depends, Request
-from fastapi.responses import JSONResponse, StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, Field
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
-from slowapi.middleware import SlowAPIMiddleware
-from loguru import logger
+import asyncio
+import base64
+import csv
+import io
+import json
+import os
+import pathlib
+import re
+import shutil
 import sys
+import tempfile
+import threading
+import time
+import uuid
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Literal, Optional
 
 import httpx
 import uvicorn
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from loguru import logger
+from pydantic import BaseModel, Field
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.util import get_remote_address
 
 # =========================
 # Config
@@ -37,10 +48,12 @@ os.makedirs(PUBLIC_FILES_DIR, exist_ok=True)
 
 # Single-use token TTL (if nobody downloads within this TTL, file is deleted)
 ONCE_TOKEN_TTL_SEC = int(os.getenv("ONCE_TOKEN_TTL_SEC", "86400"))
-DELETE_AFTER_SERVE = (os.getenv("DELETE_AFTER_SERVE", "true").lower() == "true")
+DELETE_AFTER_SERVE = os.getenv("DELETE_AFTER_SERVE", "true").lower() == "true"
 
 # Google Drive (optional)
-DRIVE_ENABLED = (os.getenv("DRIVE_ENABLED") or ("oauth" if os.getenv("GOOGLE_REFRESH_TOKEN") else "")).lower() in ("oauth","service")
+DRIVE_ENABLED = (
+    os.getenv("DRIVE_ENABLED") or ("oauth" if os.getenv("GOOGLE_REFRESH_TOKEN") else "")
+).lower() in ("oauth", "service")
 DRIVE_AUTH = (os.getenv("DRIVE_AUTH") or "oauth").lower()  # "oauth" | "service"
 DRIVE_FOLDER_ID_DEFAULT = (os.getenv("DRIVE_FOLDER_ID") or "").strip() or None
 DRIVE_PUBLIC = (os.getenv("DRIVE_PUBLIC") or "false").lower() == "true"
@@ -80,18 +93,20 @@ limiter = Limiter(key_func=get_remote_address)
 # =========================
 security = HTTPBearer(auto_error=False)
 
+
 async def verify_api_key(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
     """Optional API key verification"""
     if not API_KEY:
         return True  # No API key required
-    
+
     if not credentials:
         raise HTTPException(status_code=401, detail="API key required")
-    
+
     if credentials.credentials != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
-    
+
     return True
+
 
 # =========================
 # In-memory registries
@@ -104,12 +119,14 @@ ONCE_TOKENS: Dict[str, Dict[str, Any]] = {}
 # status: queued | downloading | ready | error
 JOBS: Dict[str, Dict[str, Any]] = {}
 
+
 # =========================
 # Utils
 # =========================
 def sanitize_filename(name: str) -> str:
     safe = re.sub(r"[^a-zA-Z0-9._-]", "_", name)
     return safe.strip(" .")
+
 
 async def run(cmd: List[str], timeout: Optional[int] = None) -> tuple[int, str, str]:
     proc = await asyncio.create_subprocess_exec(
@@ -118,13 +135,17 @@ async def run(cmd: List[str], timeout: Optional[int] = None) -> tuple[int, str, 
     try:
         so, se = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
-        try: proc.kill()
-        except Exception: pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
         return 124, "", "Timeout"
     return proc.returncode, so.decode(errors="ignore"), se.decode(errors="ignore")
 
+
 async def safe_callback(url: str, payload: dict):
-    if not url: return
+    if not url:
+        return
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             await client.post(url, json=payload)
@@ -132,11 +153,100 @@ async def safe_callback(url: str, payload: dict):
         # best effort only
         pass
 
+
 def job_set(tag: str, **kw):
     rec = JOBS.get(tag, {"tag": tag})
     rec.update(kw)
     rec["updated_at"] = datetime.utcnow().isoformat()
     JOBS[tag] = rec
+
+
+# =========================
+# Discover endpoint helpers
+# =========================
+def _parse_dateafter(s: Optional[str]) -> Optional[str]:
+    """Parse dateafter parameter into yt-dlp format, gracefully ignoring invalid patterns."""
+    if not s or not s.strip():
+        return None
+
+    s = s.strip()
+
+    # Handle YYYYMMDD format
+    if re.match(r"^\d{8}$", s):
+        return s
+
+    # Handle now-<days>days format
+    match = re.match(r"^now-(\d+)days?$", s)
+    if match:
+        days = int(match.group(1))
+        target_date = datetime.utcnow() - timedelta(days=days)
+        return target_date.strftime("%Y%m%d")
+
+    # Invalid format - gracefully ignore
+    return None
+
+
+def _synthesize_match_filter(
+    base: Optional[str], min_duration: Optional[int], max_duration: Optional[int]
+) -> Optional[str]:
+    """Synthesize match filter combining user expression with duration constraints."""
+    filters = []
+
+    # Add user-provided filter
+    if base and base.strip():
+        filters.append(f"({base.strip()})")
+
+    # Add duration constraints
+    if min_duration is not None and min_duration >= 0:
+        filters.append(f"(duration >= {min_duration})")
+
+    if max_duration is not None and max_duration >= 0:
+        filters.append(f"(duration <= {max_duration})")
+
+    if not filters:
+        return None
+
+    return " & ".join(filters)
+
+
+def _rows_to_csv(rows: List[Dict[str, Any]], fields: Optional[str]) -> bytes:
+    """Convert list of dicts to CSV bytes."""
+    if not rows:
+        return b""
+
+    # Determine fields to include
+    if fields and fields.strip():
+        field_list = [f.strip() for f in fields.split(",") if f.strip()]
+    else:
+        # Default fields
+        field_list = [
+            "id",
+            "title",
+            "url",
+            "duration",
+            "view_count",
+            "like_count",
+            "uploader",
+            "upload_date",
+        ]
+
+    # Filter to only include fields that exist in at least one row
+    available_fields = set()
+    for row in rows:
+        available_fields.update(row.keys())
+
+    field_list = [f for f in field_list if f in available_fields]
+
+    # Generate CSV
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=field_list, extrasaction="ignore")
+    writer.writeheader()
+
+    for row in rows:
+        writer.writerow(row)
+
+    return output.getvalue().encode("utf-8")
+
 
 # =========================
 # Single-use link helpers (LOCAL)
@@ -147,10 +257,12 @@ def _file_stat(path: str) -> tuple[int, str]:
         raise FileNotFoundError
     return (p.stat().st_size, p.name)
 
+
 def _build_once_url(token: str) -> str:
     if not PUBLIC_BASE_URL:
         return f"/once/{token}"
     return f"{PUBLIC_BASE_URL}/once/{token}"
+
 
 def make_single_use_url(filename: str, tag: str) -> str:
     path = os.path.join(PUBLIC_FILES_DIR, filename)
@@ -159,17 +271,19 @@ def make_single_use_url(filename: str, tag: str) -> str:
     ONCE_TOKENS[token] = {
         "path": path,
         "size": size,
-        "active": 0,         # concurrent streams
-        "consumed": False,   # true once any bytes were sent
+        "active": 0,  # concurrent streams
+        "consumed": False,  # true once any bytes were sent
         "last_seen": time.time(),
         "expiry": time.time() + ONCE_TOKEN_TTL_SEC,
         "tag": tag,
     }
     return _build_once_url(token)
 
+
 def _maybe_delete_and_purge(token: str):
     meta = ONCE_TOKENS.get(token)
-    if not meta: return
+    if not meta:
+        return
     if meta["active"] == 0 and meta["consumed"]:
         try:
             if os.path.exists(meta["path"]):
@@ -177,6 +291,7 @@ def _maybe_delete_and_purge(token: str):
         except Exception:
             pass
         ONCE_TOKENS.pop(token, None)
+
 
 def _janitor_loop():
     while True:
@@ -189,11 +304,14 @@ def _janitor_loop():
             for tk in expired:
                 m = ONCE_TOKENS.pop(tk, None)
                 if m and os.path.exists(m["path"]) and not m["consumed"]:
-                    try: os.remove(m["path"])
-                    except Exception: pass
+                    try:
+                        os.remove(m["path"])
+                    except Exception:
+                        pass
         except Exception:
             pass
         time.sleep(60)
+
 
 threading.Thread(target=_janitor_loop, daemon=True).start()
 
@@ -201,6 +319,8 @@ threading.Thread(target=_janitor_loop, daemon=True).start()
 # Google Drive (optional)
 # =========================
 _drive_service = None
+
+
 def _build_drive():
     global _drive_service
     if _drive_service or not DRIVE_ENABLED:
@@ -208,11 +328,14 @@ def _build_drive():
     from google.oauth2 import service_account
     from google.oauth2.credentials import Credentials
     from googleapiclient.discovery import build
+
     if DRIVE_AUTH == "oauth":
         client_id = os.getenv("GOOGLE_CLIENT_ID")
         client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
         refresh_token = os.getenv("GOOGLE_REFRESH_TOKEN")
-        scopes = (os.getenv("GOOGLE_SCOPES") or "https://www.googleapis.com/auth/drive.file").split()
+        scopes = (
+            os.getenv("GOOGLE_SCOPES") or "https://www.googleapis.com/auth/drive.file"
+        ).split()
         if not (client_id and client_secret and refresh_token):
             raise RuntimeError("OAuth selected but GOOGLE_CLIENT_ID/SECRET/REFRESH_TOKEN missing")
         creds = Credentials(
@@ -230,24 +353,31 @@ def _build_drive():
     if not service_json and os.getenv("DRIVE_SERVICE_ACCOUNT_JSON_B64"):
         service_json = base64.b64decode(os.getenv("DRIVE_SERVICE_ACCOUNT_JSON_B64")).decode("utf-8")
     if not service_json:
-        raise RuntimeError("Service auth selected but DRIVE_SERVICE_ACCOUNT_JSON(_B64) not provided")
+        raise RuntimeError(
+            "Service auth selected but DRIVE_SERVICE_ACCOUNT_JSON(_B64) not provided"
+        )
     creds_info = json.loads(service_json)
     scopes = ["https://www.googleapis.com/auth/drive"]
     sa = service_account.Credentials.from_service_account_info(creds_info, scopes=scopes)
     _drive_service = build("drive", "v3", credentials=sa, cache_discovery=False)
     return _drive_service
 
+
 def drive_upload(local_path: str, out_name: str, folder_id: Optional[str]) -> dict:
     svc = _build_drive()
     from googleapiclient.http import MediaFileUpload
+
     meta = {"name": out_name}
     if folder_id:
         meta["parents"] = [folder_id]
     media = MediaFileUpload(local_path, resumable=True)
     file = svc.files().create(body=meta, media_body=media, fields="id, webViewLink").execute()
     if DRIVE_PUBLIC:
-        svc.permissions().create(fileId=file["id"], body={"role": "reader", "type": "anyone"}).execute()
+        svc.permissions().create(
+            fileId=file["id"], body={"role": "reader", "type": "anyone"}
+        ).execute()
     return {"file_id": file["id"], "webViewLink": file.get("webViewLink")}
+
 
 # =========================
 # FastAPI app
@@ -274,6 +404,7 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
 
+
 # Security headers middleware
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
@@ -284,17 +415,19 @@ async def add_security_headers(request: Request, call_next):
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     return response
 
+
 # Request logging middleware
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     start_time = time.time()
     logger.info(f"Request: {request.method} {request.url}")
-    
+
     response = await call_next(request)
-    
+
     process_time = time.time() - start_time
     logger.info(f"Response: {response.status_code} - {process_time:.3f}s")
     return response
+
 
 @app.get("/")
 def root():
@@ -311,6 +444,7 @@ def root():
         "time": datetime.utcnow().isoformat(),
     }
 
+
 @app.get("/healthz")
 @limiter.limit("60/minute")
 def healthz(request: Request):
@@ -325,33 +459,35 @@ def healthz(request: Request):
                 "storage": "healthy" if os.path.exists(PUBLIC_FILES_DIR) else "unhealthy",
                 "drive": "enabled" if DRIVE_ENABLED else "disabled",
                 "memory": "healthy",  # Could add actual memory check
-            }
+            },
         }
-        
+
         # Check if any critical checks failed
-        if any(check == "unhealthy" for check in health_status["checks"].values() if check != "disabled"):
+        if any(
+            check == "unhealthy"
+            for check in health_status["checks"].values()
+            if check != "disabled"
+        ):
             health_status["status"] = "unhealthy"
             return JSONResponse(health_status, status_code=503)
-            
+
         return health_status
     except Exception as e:
         logger.error(f"Health check failed: {e}")
-        return JSONResponse({
-            "status": "unhealthy",
-            "error": str(e),
-            "timestamp": datetime.utcnow().isoformat()
-        }, status_code=503)
+        return JSONResponse(
+            {"status": "unhealthy", "error": str(e), "timestamp": datetime.utcnow().isoformat()},
+            status_code=503,
+        )
+
 
 @app.get("/metrics")
 @limiter.limit("30/minute")
 def metrics(request: Request):
     """Basic metrics endpoint for monitoring"""
     try:
-        from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
-        return StreamingResponse(
-            iter([generate_latest()]), 
-            media_type=CONTENT_TYPE_LATEST
-        )
+        from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+
+        return StreamingResponse(iter([generate_latest()]), media_type=CONTENT_TYPE_LATEST)
     except ImportError:
         # Fallback metrics if prometheus client not available
         return {
@@ -360,14 +496,15 @@ def metrics(request: Request):
                 "by_status": {
                     status: len([j for j in JOBS.values() if j.get("status") == status])
                     for status in ["queued", "downloading", "ready", "error"]
-                }
+                },
             },
             "tokens": {
                 "active": len(ONCE_TOKENS),
-                "consumed": len([t for t in ONCE_TOKENS.values() if t.get("consumed", False)])
+                "consumed": len([t for t in ONCE_TOKENS.values() if t.get("consumed", False)]),
             },
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.utcnow().isoformat(),
         }
+
 
 # =========================
 # Models
@@ -379,12 +516,13 @@ class DownloadReq(BaseModel):
     callback_url: Optional[str] = None
     quality: Literal["BEST_ORIGINAL", "BEST_MP4", "STRICT_MP4_REENC"] = "BEST_MP4"
     timeout: Optional[int] = DOWNLOAD_TIMEOUT
-    dest: Optional[Literal["LOCAL","DRIVE"]] = None
+    dest: Optional[Literal["LOCAL", "DRIVE"]] = None
     drive_folder: Optional[str] = None
     # hardening knobs
-    retries: Optional[int] = 3            # times per strategy
-    socket_timeout: Optional[int] = 30    # yt-dlp --socket-timeout
-    prefer_api: Optional[bool] = True     # try rumble:use_api first
+    retries: Optional[int] = 3  # times per strategy
+    socket_timeout: Optional[int] = 30  # yt-dlp --socket-timeout
+    prefer_api: Optional[bool] = True  # try rumble:use_api first
+
 
 class DownloadAck(BaseModel):
     accepted: bool
@@ -392,15 +530,18 @@ class DownloadAck(BaseModel):
     expected_name: Optional[str]
     note: str
 
+
 # =========================
 # Routes
 # =========================
 @app.post("/download", response_model=DownloadAck)
 @limiter.limit("10/minute")
-async def download(request: Request, req: DownloadReq, bg: BackgroundTasks, _: bool = Depends(verify_api_key)):
+async def download(
+    request: Request, req: DownloadReq, bg: BackgroundTasks, _: bool = Depends(verify_api_key)
+):
     """Download media from URL"""
     logger.info(f"Download request: {req.url} with tag {req.tag}")
-    
+
     if not req.url or not isinstance(req.url, str):
         raise HTTPException(status_code=400, detail="Missing url")
 
@@ -413,13 +554,16 @@ async def download(request: Request, req: DownloadReq, bg: BackgroundTasks, _: b
     # pick destination
     dest = (req.dest or DEFAULT_DEST).upper()
     if dest == "DRIVE" and not DRIVE_ENABLED:
-        raise HTTPException(status_code=400, detail="Drive not configured; use LOCAL or enable Drive")
+        raise HTTPException(
+            status_code=400, detail="Drive not configured; use LOCAL or enable Drive"
+        )
 
     job_set(req.tag, status="queued", expected_name=expected, dest=dest)
     bg.add_task(worker_job, req, expected, dest)
-    
+
     logger.info(f"Download job queued: {req.tag}")
     return DownloadAck(accepted=True, tag=req.tag, expected_name=expected, note="processing")
+
 
 @app.get("/status")
 @limiter.limit("60/minute")
@@ -429,6 +573,7 @@ def get_status(request: Request, tag: str = Query(...)):
     if not rec:
         return JSONResponse({"tag": tag, "status": "unknown"}, status_code=404)
     return {"tag": tag, "status": rec.get("status"), "dest": rec.get("dest")}
+
 
 @app.get("/result")
 @limiter.limit("30/minute")
@@ -442,18 +587,28 @@ def get_result(request: Request, tag: str = Query(...)):
     if st == "ready":
         return JSONResponse({"tag": tag, "status": "ready", **payload}, status_code=200)
     if st == "error":
-        return JSONResponse({"tag": tag, "status": "error", "error_message": payload.get("error_message","unknown")}, status_code=500)
+        return JSONResponse(
+            {
+                "tag": tag,
+                "status": "error",
+                "error_message": payload.get("error_message", "unknown"),
+            },
+            status_code=500,
+        )
     return JSONResponse({"tag": tag, "status": st or "queued"}, status_code=202)
+
 
 @app.get("/once/{token}")
 @limiter.limit("30/minute")
-def serve_single_use(request: Request, token: str, range_header: Optional[str] = Header(default=None, alias="Range")):
+def serve_single_use(
+    request: Request, token: str, range_header: Optional[str] = Header(default=None, alias="Range")
+):
     """
     Streams the file ONCE (supports Range). After all concurrent streams finish,
     the file is deleted and the token is invalidated.
     """
     logger.info(f"Serving single-use file with token: {token}")
-    
+
     meta = ONCE_TOKENS.get(token)
     if not meta:
         raise HTTPException(status_code=404, detail="Expired or invalid link")
@@ -483,8 +638,10 @@ def serve_single_use(request: Request, token: str, range_header: Optional[str] =
             s, e = rng.split("-")
             start = int(s) if s else 0
             end = int(e) if e else (size - 1)
-            if end >= size: end = size - 1
-            if start > end or start >= size: raise ValueError
+            if end >= size:
+                end = size - 1
+            if start > end or start >= size:
+                raise ValueError
             headers["Content-Range"] = f"bytes {start}-{end}/{size}"
             headers["Content-Length"] = str(end - start + 1)
             status_code = 206
@@ -521,6 +678,146 @@ def serve_single_use(request: Request, token: str, range_header: Optional[str] =
 
     return StreamingResponse(file_iter(), status_code=status_code, headers=headers)
 
+
+@app.get("/discover")
+@limiter.limit("20/minute")
+async def discover(
+    request: Request,
+    sources: str = Query(..., description="Comma-separated URLs"),
+    format: str = Query("csv", description="Output format: csv, json, or ndjson"),
+    limit: int = Query(100, ge=1, le=1000, description="Limit per source (1-1000)"),
+    min_views: Optional[int] = Query(None, ge=0, description="Minimum view count"),
+    min_duration: Optional[int] = Query(None, ge=0, description="Minimum duration in seconds"),
+    max_duration: Optional[int] = Query(None, ge=0, description="Maximum duration in seconds"),
+    dateafter: Optional[str] = Query(None, description="Date filter: YYYYMMDD or now-<days>days"),
+    match_filter: Optional[str] = Query(None, description="Raw yt-dlp match filter expression"),
+    fields: Optional[str] = Query(None, description="CSV field list"),
+    filename_hint: Optional[str] = Query(None, description="Ignored, for symmetry"),
+    _: bool = Depends(verify_api_key),
+):
+    """Discover metadata from one or more video sources without downloading."""
+
+    # Validate sources
+    source_urls = [url.strip() for url in sources.split(",") if url.strip()]
+    if not source_urls:
+        raise HTTPException(status_code=400, detail="No valid sources provided")
+
+    # Validate format
+    if format not in ("csv", "json", "ndjson"):
+        format = "csv"  # Default to csv for invalid formats
+
+    logger.info(f"Discover request: {len(source_urls)} sources, format={format}, limit={limit}")
+
+    all_videos = []
+    seen_ids = set()
+
+    # Parse dateafter
+    parsed_dateafter = _parse_dateafter(dateafter)
+
+    # Synthesize match filter
+    combined_match_filter = _synthesize_match_filter(match_filter, min_duration, max_duration)
+
+    # Process each source
+    for source_url in source_urls:
+        try:
+            # Build yt-dlp command
+            cmd = [
+                "yt-dlp",
+                "--skip-download",
+                "--dump-json",
+                "--ignore-errors",
+                "--no-warnings",
+                "--force-ipv4",
+                "--socket-timeout",
+                "30",
+                "--retries",
+                "10",
+                "--fragment-retries",
+                "50",
+                "--concurrent-fragments",
+                "10",
+                "--user-agent",
+                "Mozilla/5.0",
+                "--playlist-end",
+                str(limit),
+            ]
+
+            # Add optional filters
+            if parsed_dateafter:
+                cmd.extend(["--dateafter", parsed_dateafter])
+
+            if min_views is not None:
+                cmd.extend(["--min-views", str(min_views)])
+
+            if combined_match_filter:
+                cmd.extend(["--match-filter", combined_match_filter])
+
+            cmd.append(source_url)
+
+            logger.info(f"Running yt-dlp for source: {source_url}")
+
+            # Execute command
+            rc, stdout, stderr = await run(cmd, timeout=DOWNLOAD_TIMEOUT)
+
+            # Log warnings for non-zero return codes (but continue processing)
+            if rc not in (0, 1):
+                logger.warning(f"yt-dlp returned rc={rc} for source {source_url}: {stderr}")
+
+            # Parse JSON lines from stdout
+            for line in stdout.strip().split("\n"):
+                if not line.strip():
+                    continue
+
+                try:
+                    obj = json.loads(line)
+
+                    # Skip playlist objects, only process actual videos
+                    if obj.get("_type") in ("playlist", "multi_video"):
+                        continue
+
+                    # Normalize URL field
+                    obj["url"] = obj.get("webpage_url") or obj.get("url") or ""
+
+                    # De-duplicate by ID
+                    video_id = obj.get("id")
+                    if video_id and video_id not in seen_ids:
+                        seen_ids.add(video_id)
+                        all_videos.append(obj)
+
+                except (json.JSONDecodeError, KeyError) as e:
+                    logger.warning(f"Failed to parse JSON line: {e}")
+                    continue
+
+        except Exception as e:
+            logger.warning(f"Error processing source {source_url}: {e}")
+            continue
+
+    # Sort by upload_date (newest first)
+    def get_upload_date(video):
+        upload_date = video.get("upload_date")
+        if upload_date:
+            try:
+                return datetime.strptime(str(upload_date), "%Y%m%d")
+            except ValueError:
+                pass
+        return datetime.min
+
+    all_videos.sort(key=get_upload_date, reverse=True)
+
+    logger.info(f"Discover completed: {len(all_videos)} unique videos found")
+
+    # Format output
+    if format == "csv":
+        csv_data = _rows_to_csv(all_videos, fields)
+        return Response(content=csv_data, media_type="text/csv")
+    elif format == "json":
+        return Response(content=json.dumps(all_videos, indent=2), media_type="application/json")
+    elif format == "ndjson":
+        ndjson_lines = [json.dumps(video) for video in all_videos]
+        ndjson_content = "\n".join(ndjson_lines)
+        return Response(content=ndjson_content, media_type="application/x-ndjson")
+
+
 # =========================
 # Worker
 # =========================
@@ -552,14 +849,22 @@ async def worker_job(req: DownloadReq, expected_name: str, dest: str):
             "--no-warnings",
             "--ignore-errors",
             "--force-ipv4",
-            "--socket-timeout", str(sock_to),
-            "--retries", "10",
-            "--fragment-retries", "50",
-            "--concurrent-fragments", "10",
-            "-o", temp_tpl,
+            "--socket-timeout",
+            str(sock_to),
+            "--retries",
+            "10",
+            "--fragment-retries",
+            "50",
+            "--concurrent-fragments",
+            "10",
+            "-o",
+            temp_tpl,
             req.url,
         ]
-        common_ua = common + ["--user-agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"]
+        common_ua = common + [
+            "--user-agent",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        ]
         qual_flags = build_quality_flags(req.quality)
 
         strategies: List[List[str]] = []
@@ -572,9 +877,11 @@ async def worker_job(req: DownloadReq, expected_name: str, dest: str):
         attempts = int(req.retries or 3)
         last_rc, last_se = None, ""
         success = False
-        
-        logger.info(f"Job {req.tag}: Trying {len(strategies)} strategies with {attempts} attempts each")
-        
+
+        logger.info(
+            f"Job {req.tag}: Trying {len(strategies)} strategies with {attempts} attempts each"
+        )
+
         for strat_idx, strat_cmd in enumerate(strategies):
             logger.info(f"Job {req.tag}: Strategy {strat_idx + 1}/{len(strategies)}")
             for attempt in range(1, attempts + 1):
@@ -582,7 +889,9 @@ async def worker_job(req: DownloadReq, expected_name: str, dest: str):
                 rc, so, se = await run(strat_cmd, timeout=overall_to)
                 if rc == 0:
                     success = True
-                    logger.info(f"Job {req.tag}: Download successful on strategy {strat_idx + 1}, attempt {attempt}")
+                    logger.info(
+                        f"Job {req.tag}: Download successful on strategy {strat_idx + 1}, attempt {attempt}"
+                    )
                     break
                 last_rc, last_se = rc, se
                 logger.warning(f"Job {req.tag}: Attempt {attempt} failed with rc={rc}")
@@ -594,15 +903,22 @@ async def worker_job(req: DownloadReq, expected_name: str, dest: str):
             err = f"yt-dlp failed (last rc={last_rc})\n{(last_se or '')[-1500:]}"
             logger.error(f"Job {req.tag}: {err}")
             job_set(req.tag, status="error", payload={"error_message": err})
-            await safe_callback(req.callback_url or "", {
-                "status":"error","tag":req.tag,"error_message":err,
-                "started_at": started_iso, "completed_at": datetime.utcnow().isoformat()
-            })
+            await safe_callback(
+                req.callback_url or "",
+                {
+                    "status": "error",
+                    "tag": req.tag,
+                    "error_message": err,
+                    "started_at": started_iso,
+                    "completed_at": datetime.utcnow().isoformat(),
+                },
+            )
             return
 
         # ---------- Pick newest finished media ----------
         files = [
-            f for f in os.listdir(work_dir)
+            f
+            for f in os.listdir(work_dir)
             if os.path.isfile(os.path.join(work_dir, f)) and not f.endswith(".part")
         ]
         files = [f for f in files if re.search(r"\.(mp4|mkv|webm|m4a|mov|mp3)$", f, re.I)]
@@ -610,10 +926,16 @@ async def worker_job(req: DownloadReq, expected_name: str, dest: str):
             err = "no media file produced"
             logger.error(f"Job {req.tag}: {err}")
             job_set(req.tag, status="error", payload={"error_message": err})
-            await safe_callback(req.callback_url or "", {
-                "status":"error","tag":req.tag,"error_message":err,
-                "started_at": started_iso, "completed_at": datetime.utcnow().isoformat()
-            })
+            await safe_callback(
+                req.callback_url or "",
+                {
+                    "status": "error",
+                    "tag": req.tag,
+                    "error_message": err,
+                    "started_at": started_iso,
+                    "completed_at": datetime.utcnow().isoformat(),
+                },
+            )
             return
 
         files.sort(key=lambda f: os.path.getmtime(os.path.join(work_dir, f)), reverse=True)
@@ -627,17 +949,35 @@ async def worker_job(req: DownloadReq, expected_name: str, dest: str):
             if rc2 != 0:
                 logger.warning(f"Job {req.tag}: Copy failed, trying re-encode")
                 rc3, _, _ = await run(
-                    ["ffmpeg", "-y", "-i", src, "-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart", out_local],
-                    timeout=max(1800, overall_to)
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-i",
+                        src,
+                        "-c:v",
+                        "libx264",
+                        "-c:a",
+                        "aac",
+                        "-movflags",
+                        "+faststart",
+                        out_local,
+                    ],
+                    timeout=max(1800, overall_to),
                 )
                 if rc3 != 0:
                     err = "ffmpeg failed"
                     logger.error(f"Job {req.tag}: {err}")
                     job_set(req.tag, status="error", payload={"error_message": err})
-                    await safe_callback(req.callback_url or "", {
-                        "status":"error","tag":req.tag,"error_message":err,
-                        "started_at": started_iso, "completed_at": datetime.utcnow().isoformat()
-                    })
+                    await safe_callback(
+                        req.callback_url or "",
+                        {
+                            "status": "error",
+                            "tag": req.tag,
+                            "error_message": err,
+                            "started_at": started_iso,
+                            "completed_at": datetime.utcnow().isoformat(),
+                        },
+                    )
                     return
         else:
             shutil.move(src, out_local)
@@ -660,13 +1000,20 @@ async def worker_job(req: DownloadReq, expected_name: str, dest: str):
                 }
                 job_set(req.tag, status="ready", payload=payload)
                 logger.info(f"Job {req.tag}: Successfully uploaded to Drive: {up['file_id']}")
-                await safe_callback(req.callback_url or "", {
-                    "status":"ready", **payload,
-                    "started_at": started_iso, "completed_at": datetime.utcnow().isoformat()
-                })
+                await safe_callback(
+                    req.callback_url or "",
+                    {
+                        "status": "ready",
+                        **payload,
+                        "started_at": started_iso,
+                        "completed_at": datetime.utcnow().isoformat(),
+                    },
+                )
             finally:
-                try: os.remove(out_local)
-                except Exception: pass
+                try:
+                    os.remove(out_local)
+                except Exception:
+                    pass
         else:
             logger.info(f"Job {req.tag}: Saving to local storage")
             public_path = os.path.join(PUBLIC_FILES_DIR, expected_name)
@@ -682,22 +1029,36 @@ async def worker_job(req: DownloadReq, expected_name: str, dest: str):
             }
             job_set(req.tag, status="ready", payload=payload)
             logger.info(f"Job {req.tag}: File ready at {once_url}")
-            await safe_callback(req.callback_url or "", {
-                "status":"ready", **payload,
-                "started_at": started_iso, "completed_at": datetime.utcnow().isoformat()
-            })
+            await safe_callback(
+                req.callback_url or "",
+                {
+                    "status": "ready",
+                    **payload,
+                    "started_at": started_iso,
+                    "completed_at": datetime.utcnow().isoformat(),
+                },
+            )
 
     except Exception as e:
         err = str(e)
         logger.error(f"Job {req.tag}: Unexpected error: {err}")
         job_set(req.tag, status="error", payload={"error_message": err})
-        await safe_callback(req.callback_url or "", {
-            "status":"error","tag":req.tag,"error_message":err,
-            "started_at": started_iso, "completed_at": datetime.utcnow().isoformat()
-        })
+        await safe_callback(
+            req.callback_url or "",
+            {
+                "status": "error",
+                "tag": req.tag,
+                "error_message": err,
+                "started_at": started_iso,
+                "completed_at": datetime.utcnow().isoformat(),
+            },
+        )
     finally:
-        try: shutil.rmtree(work_dir, ignore_errors=True)
-        except Exception: pass
+        try:
+            shutil.rmtree(work_dir, ignore_errors=True)
+        except Exception:
+            pass
+
 
 # =========================
 # Main

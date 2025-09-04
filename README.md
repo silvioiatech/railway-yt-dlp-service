@@ -110,6 +110,52 @@ Get download job result with download links.
 #### GET /once/{token}
 Stream downloaded file (single-use, supports HTTP ranges).
 
+#### GET /discover
+Discover metadata from video sources without downloading.
+
+Performs metadata discovery across one or more provided source URLs (channels, playlists, individual videos) using yt-dlp without downloading content.
+
+**Query Parameters:**
+- `sources` (required): Comma-separated URLs to discover
+- `format` (optional): Output format - csv, json, or ndjson (default: csv)
+- `limit` (optional): Limit per source, 1-1000 (default: 100)
+- `min_views` (optional): Minimum view count filter
+- `min_duration` (optional): Minimum duration in seconds
+- `max_duration` (optional): Maximum duration in seconds
+- `dateafter` (optional): Date filter - YYYYMMDD or now-<days>days format
+- `match_filter` (optional): Raw yt-dlp match filter expression
+- `fields` (optional): CSV field list (default: id,title,url,duration,view_count,like_count,uploader,upload_date)
+
+**Rate Limit:** 20 requests per minute  
+**Authentication:** API key required (if configured)
+
+**Sample Request:**
+```
+GET /discover?sources=https://youtube.com/playlist?list=PLrAXtmRdnEQy6nuLMq6VmpLgvIgx8B_D2&format=json&limit=5&min_duration=60
+```
+
+**Sample Response (CSV):**
+```csv
+id,title,url,duration,view_count,uploader,upload_date
+abc123,Sample Video,https://youtube.com/watch?v=abc123,120,1500,Creator,20231201
+def456,Another Video,https://youtube.com/watch?v=def456,240,2300,Creator,20231205
+```
+
+**Sample Response (JSON):**
+```json
+[
+  {
+    "id": "abc123",
+    "title": "Sample Video", 
+    "url": "https://youtube.com/watch?v=abc123",
+    "duration": 120,
+    "view_count": 1500,
+    "uploader": "Creator",
+    "upload_date": "20231201"
+  }
+]
+```
+
 ### Monitoring Endpoints
 
 #### GET /healthz
