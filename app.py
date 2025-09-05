@@ -421,14 +421,175 @@ async def download(request: Request, req: DownloadReq, bg: BackgroundTasks, _: b
     logger.info(f"Download job queued: {req.tag}")
     return DownloadAck(accepted=True, tag=req.tag, expected_name=expected, note="processing")
 
+# =========================
+# Status Check Functions
+# =========================
+def _check_storage_config() -> Dict[str, Any]:
+    """Check local storage configuration and state"""
+    try:
+        configured = bool(PUBLIC_FILES_DIR)
+        accessible = os.path.exists(PUBLIC_FILES_DIR) and os.access(PUBLIC_FILES_DIR, os.W_OK)
+        
+        if configured and accessible:
+            state = "active"
+        elif configured:
+            state = "degraded"  # Configured but not accessible
+        else:
+            state = "inactive"  # Not configured
+            
+        return {
+            "configured": configured,
+            "state": state,
+            "details": {
+                "directory_exists": os.path.exists(PUBLIC_FILES_DIR) if configured else None,
+                "writable": accessible if configured else None
+            }
+        }
+    except Exception as e:
+        logger.error(f"Storage config check failed: {e}")
+        return {"configured": False, "state": "inactive", "details": {"error": "check_failed"}}
+
+def _check_drive_config() -> Dict[str, Any]:
+    """Check Google Drive configuration and state"""
+    try:
+        if not DRIVE_ENABLED:
+            return {"configured": False, "state": "inactive", "details": {"enabled": False}}
+        
+        configured = True
+        
+        # Check if required environment variables are present
+        if DRIVE_AUTH == "oauth":
+            required_vars = ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_REFRESH_TOKEN"]
+            missing_vars = [var for var in required_vars if not os.getenv(var)]
+            if missing_vars:
+                return {
+                    "configured": False, 
+                    "state": "inactive",
+                    "details": {"auth_type": "oauth", "missing_config": True}
+                }
+        elif DRIVE_AUTH == "service":
+            service_json = os.getenv("DRIVE_SERVICE_ACCOUNT_JSON")
+            service_json_b64 = os.getenv("DRIVE_SERVICE_ACCOUNT_JSON_B64")
+            if not service_json and not service_json_b64:
+                return {
+                    "configured": False,
+                    "state": "inactive", 
+                    "details": {"auth_type": "service", "missing_config": True}
+                }
+        
+        # Try to build drive service to test connectivity
+        try:
+            _build_drive()
+            state = "active"
+            details = {"auth_type": DRIVE_AUTH, "connectivity": "ok"}
+        except Exception as e:
+            state = "degraded"  # Configured but connection failed
+            details = {"auth_type": DRIVE_AUTH, "connectivity": "failed"}
+            
+        return {"configured": configured, "state": state, "details": details}
+        
+    except Exception as e:
+        logger.error(f"Drive config check failed: {e}")
+        return {"configured": False, "state": "inactive", "details": {"error": "check_failed"}}
+
+def _check_security_config() -> Dict[str, Any]:
+    """Check security configuration and state"""
+    try:
+        api_key_configured = bool(API_KEY)
+        cors_configured = CORS_ORIGINS != ["*"]  # Default is "*", so configured means restricted
+        
+        if api_key_configured and cors_configured:
+            state = "active"  # Both security measures enabled
+        elif api_key_configured or cors_configured:
+            state = "degraded"  # Partial security
+        else:
+            state = "degraded"  # No additional security (still functional)
+            
+        return {
+            "configured": api_key_configured or cors_configured,
+            "state": state,
+            "details": {
+                "api_key_protection": api_key_configured,
+                "cors_restricted": cors_configured
+            }
+        }
+    except Exception as e:
+        logger.error(f"Security config check failed: {e}")
+        return {"configured": False, "state": "inactive", "details": {"error": "check_failed"}}
+
+def _check_rate_limiting_config() -> Dict[str, Any]:
+    """Check rate limiting configuration and state"""
+    try:
+        configured = bool(RATE_LIMIT_REQUESTS)
+        
+        # Rate limiting is always active if configured (slowapi handles it)
+        state = "active" if configured else "degraded"
+        
+        return {
+            "configured": configured,
+            "state": state,
+            "details": {
+                "limit_setting": RATE_LIMIT_REQUESTS if configured else None
+            }
+        }
+    except Exception as e:
+        logger.error(f"Rate limiting config check failed: {e}")
+        return {"configured": False, "state": "inactive", "details": {"error": "check_failed"}}
+
 @app.get("/status")
 @limiter.limit("60/minute")
-def get_status(request: Request, tag: str = Query(...)):
-    """Get download job status"""
-    rec = JOBS.get(tag)
-    if not rec:
-        return JSONResponse({"tag": tag, "status": "unknown"}, status_code=404)
-    return {"tag": tag, "status": rec.get("status"), "dest": rec.get("dest")}
+def get_status(request: Request, tag: Optional[str] = Query(None)):
+    """Get system status or download job status"""
+    if tag is None:
+        # System status - check configuration and state of core services
+        try:
+            status_checks = {
+                "storage": _check_storage_config(),
+                "drive": _check_drive_config(),
+                "security": _check_security_config(),
+                "rate_limiting": _check_rate_limiting_config(),
+            }
+        except Exception as e:
+            logger.error(f"Status check failed: {e}")
+            # Return error state if status checks fail
+            return {
+                "service": "Railway yt-dlp Service",
+                "version": "1.0.0",
+                "state": "inactive",
+                "timestamp": datetime.utcnow().isoformat(),
+                "error": "status_check_failed"
+            }
+        
+        # Determine overall state based on critical vs optional components
+        storage_state = status_checks["storage"]["state"]
+        rate_limiting_state = status_checks["rate_limiting"]["state"]
+        drive_state = status_checks["drive"]["state"]  
+        security_state = status_checks["security"]["state"]
+        
+        # Storage is critical - if it's inactive, whole service is inactive
+        if storage_state == "inactive":
+            overall_state = "inactive"
+        # If any component is degraded, service is degraded
+        elif any(state == "degraded" for state in [storage_state, rate_limiting_state, drive_state, security_state]):
+            overall_state = "degraded"
+        # Drive being inactive is OK if not enabled (doesn't make service inactive)
+        # Security being degraded is OK for basic functionality
+        else:
+            overall_state = "active"
+        
+        return {
+            "service": "Railway yt-dlp Service",
+            "version": "1.0.0",
+            "state": overall_state,
+            "timestamp": datetime.utcnow().isoformat(),
+            "components": status_checks
+        }
+    else:
+        # Job status (existing functionality)
+        rec = JOBS.get(tag)
+        if not rec:
+            return JSONResponse({"tag": tag, "status": "unknown"}, status_code=404)
+        return {"tag": tag, "status": rec.get("status"), "dest": rec.get("dest")}
 
 @app.get("/result")
 @limiter.limit("30/minute")
