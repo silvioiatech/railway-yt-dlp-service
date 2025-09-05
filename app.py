@@ -447,7 +447,12 @@ def _check_storage_config() -> Dict[str, Any]:
         }
     except Exception as e:
         logger.error(f"Storage config check failed: {e}")
-        return {"configured": False, "state": "inactive", "details": {"error": "check_failed"}}
+        return {
+            "configured": False,
+            "state": "inactive",
+            "details": {"error": "check_failed"}
+        }
+
 
 def _check_drive_config() -> Dict[str, Any]:
     """Check Google Drive configuration and state"""
@@ -487,10 +492,15 @@ def _check_drive_config() -> Dict[str, Any]:
             details = {"auth_type": DRIVE_AUTH, "connectivity": "failed"}
             
         return {"configured": configured, "state": state, "details": details}
-        
+
     except Exception as e:
         logger.error(f"Drive config check failed: {e}")
-        return {"configured": False, "state": "inactive", "details": {"error": "check_failed"}}
+        return {
+            "configured": False,
+            "state": "inactive",
+            "details": {"error": "check_failed"}
+        }
+
 
 def _check_security_config() -> Dict[str, Any]:
     """Check security configuration and state"""
@@ -515,7 +525,12 @@ def _check_security_config() -> Dict[str, Any]:
         }
     except Exception as e:
         logger.error(f"Security config check failed: {e}")
-        return {"configured": False, "state": "inactive", "details": {"error": "check_failed"}}
+        return {
+            "configured": False,
+            "state": "inactive",
+            "details": {"error": "check_failed"}
+        }
+
 
 def _check_rate_limiting_config() -> Dict[str, Any]:
     """Check rate limiting configuration and state"""
@@ -534,7 +549,12 @@ def _check_rate_limiting_config() -> Dict[str, Any]:
         }
     except Exception as e:
         logger.error(f"Rate limiting config check failed: {e}")
-        return {"configured": False, "state": "inactive", "details": {"error": "check_failed"}}
+        return {
+            "configured": False,
+            "state": "inactive",
+            "details": {"error": "check_failed"}
+        }
+
 
 @app.get("/status")
 @limiter.limit("60/minute")
@@ -572,7 +592,7 @@ def get_status(request: Request, tag: Optional[str] = Query(None)):
         # If any component is degraded, service is degraded
         elif any(state == "degraded" for state in [storage_state, rate_limiting_state, drive_state, security_state]):
             overall_state = "degraded"
-        # Drive being inactive is OK if not enabled (doesn't make service inactive)
+        # Drive being inactive is OK if not enabled (doesn't affect service)
         # Security being degraded is OK for basic functionality
         else:
             overall_state = "active"

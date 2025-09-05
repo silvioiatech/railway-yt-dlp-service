@@ -101,6 +101,53 @@ Submit a download job.
 }
 ```
 
+#### GET /status
+System status and service configuration reporting.
+
+**Response:**
+```json
+{
+  "service": "Railway yt-dlp Service",
+  "version": "1.0.0",
+  "state": "active",
+  "timestamp": "2025-01-01T12:00:00.000000",
+  "components": {
+    "storage": {
+      "configured": true,
+      "state": "active",
+      "details": {
+        "directory_exists": true,
+        "writable": true
+      }
+    },
+    "drive": {
+      "configured": false,
+      "state": "inactive",
+      "details": {
+        "enabled": false
+      }
+    },
+    "security": {
+      "configured": true,
+      "state": "active",
+      "details": {
+        "api_key_protection": true,
+        "cors_restricted": true
+      }
+    },
+    "rate_limiting": {
+      "configured": true,
+      "state": "active",
+      "details": {
+        "limit_setting": "30/minute"
+      }
+    }
+  }
+}
+```
+
+States: `active` (fully operational), `degraded` (functional with issues), `inactive` (critical failures).
+
 #### GET /status?tag={job_tag}
 Check download job status.
 
@@ -111,6 +158,9 @@ Get download job result with download links.
 Stream downloaded file (single-use, supports HTTP ranges).
 
 ### Monitoring Endpoints
+
+#### GET /status
+System status and service configuration reporting with component health checks.
 
 #### GET /healthz
 Health check endpoint.
