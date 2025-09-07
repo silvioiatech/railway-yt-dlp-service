@@ -94,6 +94,82 @@ logger.add(
 os.makedirs("logs", exist_ok=True)
 
 # =========================
+# Configuration Validation
+# =========================
+def validate_configuration():
+    """Validate environment configuration and log warnings for potential issues"""
+    warnings = []
+    errors = []
+    
+    # Critical validations
+    if not os.path.exists(PUBLIC_FILES_DIR):
+        try:
+            os.makedirs(PUBLIC_FILES_DIR, exist_ok=True)
+            logger.info(f"Created PUBLIC_FILES_DIR: {PUBLIC_FILES_DIR}")
+        except Exception as e:
+            errors.append(f"Cannot create PUBLIC_FILES_DIR {PUBLIC_FILES_DIR}: {e}")
+    
+    # Security validations
+    if not API_KEY and os.getenv("RAILWAY_ENVIRONMENT_NAME") == "production":
+        warnings.append("No API_KEY set in production environment - consider setting one for security")
+    
+    if SIGNED_LINKS_ENABLED and not LINK_SIGNING_KEY:
+        errors.append("SIGNED_LINKS_ENABLED is true but LINK_SIGNING_KEY is not provided")
+    
+    if SIGNED_LINKS_ENABLED and len(LINK_SIGNING_KEY) < 32:
+        warnings.append("LINK_SIGNING_KEY is shorter than recommended 32+ characters")
+    
+    # Drive configuration validation
+    if DRIVE_ENABLED:
+        if DRIVE_AUTH == "oauth":
+            required_oauth = ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_REFRESH_TOKEN"]
+            missing_oauth = [var for var in required_oauth if not os.getenv(var)]
+            if missing_oauth:
+                errors.append(f"DRIVE_ENABLED with oauth auth but missing: {', '.join(missing_oauth)}")
+        elif DRIVE_AUTH == "service":
+            if not os.getenv("DRIVE_SERVICE_ACCOUNT_JSON") and not os.getenv("DRIVE_SERVICE_ACCOUNT_JSON_B64"):
+                errors.append("DRIVE_ENABLED with service auth but no service account JSON provided")
+    
+    # Performance warnings
+    if DOWNLOAD_TIMEOUT > 7200:  # 2 hours
+        warnings.append(f"DOWNLOAD_TIMEOUT_SEC is quite high ({DOWNLOAD_TIMEOUT}s) - consider lowering for better resource management")
+    
+    if ONCE_TOKEN_TTL_SEC > 604800:  # 7 days
+        warnings.append(f"ONCE_TOKEN_TTL_SEC is very high ({ONCE_TOKEN_TTL_SEC}s) - files may accumulate")
+    
+    # CORS validation
+    if CORS_ORIGINS == ["*"] and API_KEY and os.getenv("RAILWAY_ENVIRONMENT_NAME") == "production":
+        warnings.append("CORS_ORIGINS is '*' in production with API_KEY - consider restricting origins")
+    
+    # Rate limit validation
+    try:
+        limit_parts = RATE_LIMIT_REQUESTS.split("/")
+        if len(limit_parts) != 2:
+            warnings.append(f"RATE_LIMIT_REQUESTS format may be invalid: {RATE_LIMIT_REQUESTS}")
+        else:
+            requests = int(limit_parts[0])
+            if requests > 100:
+                warnings.append(f"RATE_LIMIT_REQUESTS is quite high ({requests}) - consider lowering for protection")
+    except Exception:
+        warnings.append(f"RATE_LIMIT_REQUESTS format is invalid: {RATE_LIMIT_REQUESTS}")
+    
+    # Log results
+    if errors:
+        for error in errors:
+            logger.error(f"Configuration error: {error}")
+        logger.error("Application cannot start due to configuration errors")
+        sys.exit(1)
+    
+    if warnings:
+        for warning in warnings:
+            logger.warning(f"Configuration warning: {warning}")
+    
+    logger.info("Configuration validation completed successfully")
+
+# Run configuration validation
+validate_configuration()
+
+# =========================
 # Rate Limiting Setup
 # =========================
 limiter = Limiter(key_func=get_remote_address)

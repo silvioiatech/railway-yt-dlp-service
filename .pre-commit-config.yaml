@@ -40,6 +40,14 @@ repos:
 
   - repo: local
     hooks:
+      - id: config-validation
+        name: validate configuration
+        entry: sh
+        language: system
+        files: "app.py|.env.example"
+        pass_filenames: false
+        args: ["-c", "PUBLIC_FILES_DIR=/tmp/public python -c 'import app; print(\"Configuration validation passed\")'"]
+        
       - id: pytest
         name: pytest
         entry: pytest
