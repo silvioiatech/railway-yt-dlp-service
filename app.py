@@ -112,8 +112,12 @@ async def verify_api_key(credentials: Optional[HTTPAuthorizationCredentials] = D
 # In-memory registries
 # =========================
 # Single-use token registry: token -> meta
-# meta: { path, size, active, consumed, last_seen, expiry, tag }
+# meta: { path, size, active, consumed, last_seen, expiry, tag, file_id }
 ONCE_TOKENS: Dict[str, Dict[str, Any]] = {}
+
+# File registry: file_id -> { path, size, tokens, created_at }
+# tokens: set of token IDs that reference this file
+FILE_REGISTRY: Dict[str, Dict[str, Any]] = {}
 
 # Job status registry: tag -> {status, payload, updated_at, dest, expected_name}
 # status: queued | downloading | ready | error
@@ -264,52 +268,178 @@ def _build_once_url(token: str) -> str:
     return f"{PUBLIC_BASE_URL}/once/{token}"
 
 
-def make_single_use_url(filename: str, tag: str) -> str:
+def make_single_use_url(filename: str, tag: str, ttl_sec: Optional[int] = None) -> str:
+    """Create a single-use URL for a file with optional custom TTL"""
     path = os.path.join(PUBLIC_FILES_DIR, filename)
     size, _ = _file_stat(path)
+    
+    # Generate unique file ID based on path for multi-token support
+    file_id = f"file_{hash(path) & 0x7FFFFFFF:08x}"
+    
+    # Register file if not already registered
+    if file_id not in FILE_REGISTRY:
+        FILE_REGISTRY[file_id] = {
+            "path": path,
+            "size": size,
+            "tokens": set(),
+            "created_at": time.time(),
+        }
+    
+    # Create token
     token = uuid.uuid4().hex
+    effective_ttl = ttl_sec if ttl_sec is not None else ONCE_TOKEN_TTL_SEC
+    
     ONCE_TOKENS[token] = {
         "path": path,
         "size": size,
         "active": 0,  # concurrent streams
         "consumed": False,  # true once any bytes were sent
         "last_seen": time.time(),
-        "expiry": time.time() + ONCE_TOKEN_TTL_SEC,
+        "expiry": time.time() + effective_ttl,
         "tag": tag,
+        "file_id": file_id,
     }
+    
+    # Link token to file
+    FILE_REGISTRY[file_id]["tokens"].add(token)
+    
     return _build_once_url(token)
 
 
+def make_multiple_use_urls(filename: str, tag: str, count: int = 1, ttl_sec: Optional[int] = None) -> List[str]:
+    """Create multiple single-use URLs for the same file"""
+    if count <= 0:
+        raise ValueError("count must be positive")
+    
+    urls = []
+    for _ in range(count):
+        urls.append(make_single_use_url(filename, tag, ttl_sec))
+    return urls
+
+
+def mint_additional_tokens(file_id: str, count: int = 1, ttl_sec: Optional[int] = None, tag: Optional[str] = None) -> List[str]:
+    """Mint additional tokens for an existing file"""
+    if file_id not in FILE_REGISTRY:
+        raise FileNotFoundError(f"File {file_id} not found in registry")
+    
+    file_info = FILE_REGISTRY[file_id]
+    path = file_info["path"]
+    
+    # Verify file still exists
+    if not os.path.exists(path):
+        # Clean up registry
+        FILE_REGISTRY.pop(file_id, None)
+        raise FileNotFoundError(f"File at {path} no longer exists")
+    
+    size = file_info["size"]
+    effective_ttl = ttl_sec if ttl_sec is not None else ONCE_TOKEN_TTL_SEC
+    effective_tag = tag or f"mint_{file_id}"
+    
+    urls = []
+    for _ in range(count):
+        token = uuid.uuid4().hex
+        ONCE_TOKENS[token] = {
+            "path": path,
+            "size": size,
+            "active": 0,
+            "consumed": False,
+            "last_seen": time.time(),
+            "expiry": time.time() + effective_ttl,
+            "tag": effective_tag,
+            "file_id": file_id,
+        }
+        FILE_REGISTRY[file_id]["tokens"].add(token)
+        urls.append(_build_once_url(token))
+    
+    return urls
+
+
 def _maybe_delete_and_purge(token: str):
+    """Delete file and clean up token if conditions are met"""
     meta = ONCE_TOKENS.get(token)
     if not meta:
         return
+    
+    # Only mark as consumed if active streams finished and bytes were sent
     if meta["active"] == 0 and meta["consumed"]:
-        try:
-            if os.path.exists(meta["path"]):
-                os.remove(meta["path"])
-        except Exception:
-            pass
+        file_id = meta["file_id"]
+        
+        # Remove token from registry
         ONCE_TOKENS.pop(token, None)
+        
+        # Update file registry
+        if file_id in FILE_REGISTRY:
+            FILE_REGISTRY[file_id]["tokens"].discard(token)
+            
+            # Check if this was the last token for the file
+            if not FILE_REGISTRY[file_id]["tokens"]:
+                # No more tokens, safe to delete file
+                try:
+                    if os.path.exists(meta["path"]):
+                        os.remove(meta["path"])
+                        logger.info(f"Deleted file {meta['path']} (last token consumed)")
+                except Exception as e:
+                    logger.error(f"Failed to delete file {meta['path']}: {e}")
+                
+                # Remove from file registry
+                FILE_REGISTRY.pop(file_id, None)
 
 
 def _janitor_loop():
+    """Enhanced janitor loop for cleaning up expired tokens and orphaned files"""
     while True:
         try:
             now = time.time()
-            expired = []
-            for tk, meta in list(ONCE_TOKENS.items()):
+            expired_tokens = []
+            
+            # Find expired tokens
+            for token, meta in list(ONCE_TOKENS.items()):
                 if now > meta.get("expiry", 0):
-                    expired.append(tk)
-            for tk in expired:
-                m = ONCE_TOKENS.pop(tk, None)
-                if m and os.path.exists(m["path"]) and not m["consumed"]:
+                    expired_tokens.append(token)
+            
+            # Process expired tokens
+            for token in expired_tokens:
+                meta = ONCE_TOKENS.pop(token, None)
+                if not meta:
+                    continue
+                
+                file_id = meta.get("file_id")
+                if file_id and file_id in FILE_REGISTRY:
+                    FILE_REGISTRY[file_id]["tokens"].discard(token)
+                    
+                    # Delete file if not consumed and no more tokens
+                    if not meta["consumed"] and not FILE_REGISTRY[file_id]["tokens"]:
+                        try:
+                            if os.path.exists(meta["path"]):
+                                os.remove(meta["path"])
+                                logger.info(f"Deleted expired file {meta['path']}")
+                        except Exception as e:
+                            logger.error(f"Failed to delete expired file {meta['path']}: {e}")
+                        
+                        FILE_REGISTRY.pop(file_id, None)
+            
+            # Clean up orphaned file registry entries
+            orphaned_files = []
+            for file_id, file_info in list(FILE_REGISTRY.items()):
+                if not file_info["tokens"]:  # No tokens reference this file
+                    orphaned_files.append(file_id)
+            
+            for file_id in orphaned_files:
+                file_info = FILE_REGISTRY.pop(file_id, None)
+                if file_info:
                     try:
-                        os.remove(m["path"])
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+                        if os.path.exists(file_info["path"]):
+                            os.remove(file_info["path"])
+                            logger.info(f"Deleted orphaned file {file_info['path']}")
+                    except Exception as e:
+                        logger.error(f"Failed to delete orphaned file {file_info['path']}: {e}")
+            
+            if expired_tokens or orphaned_files:
+                logger.info(f"Janitor cleaned up {len(expired_tokens)} expired tokens and {len(orphaned_files)} orphaned files")
+                
+        except Exception as e:
+            logger.error(f"Janitor loop error: {e}")
+        
         time.sleep(60)
 
 
@@ -522,6 +652,11 @@ class DownloadReq(BaseModel):
     retries: Optional[int] = 3  # times per strategy
     socket_timeout: Optional[int] = 30  # yt-dlp --socket-timeout
     prefer_api: Optional[bool] = True  # try rumble:use_api first
+    # multi-artifact support
+    separate_audio_video: Optional[bool] = False  # download separate audio/video files
+    audio_format: Optional[Literal["m4a", "mp3", "best"]] = "m4a"
+    token_count: Optional[int] = Field(1, ge=1, le=5)  # number of tokens to create per artifact
+    custom_ttl: Optional[int] = Field(None, ge=60, le=604800)  # custom TTL for tokens
 
 
 class DownloadAck(BaseModel):
@@ -529,6 +664,34 @@ class DownloadAck(BaseModel):
     tag: str
     expected_name: Optional[str]
     note: str
+
+
+class MintTokenReq(BaseModel):
+    file_id: str = Field(..., description="File ID to mint tokens for")
+    count: int = Field(1, ge=1, le=10, description="Number of tokens to mint (1-10)")
+    ttl_sec: Optional[int] = Field(None, ge=60, le=604800, description="Custom TTL in seconds (60s to 7 days)")
+    tag: Optional[str] = Field(None, description="Optional tag for the new tokens")
+
+
+class MintTokenResponse(BaseModel):
+    success: bool
+    file_id: str
+    tokens_created: int
+    urls: List[str]
+    expires_in_sec: int
+
+
+class FileInfo(BaseModel):
+    file_id: str
+    filename: str
+    size: int
+    active_tokens: int
+    created_at: str
+
+
+class ListFilesResponse(BaseModel):
+    files: List[FileInfo]
+    total_files: int
 
 
 # =========================
@@ -596,6 +759,74 @@ def get_result(request: Request, tag: str = Query(...)):
             status_code=500,
         )
     return JSONResponse({"tag": tag, "status": st or "queued"}, status_code=202)
+
+
+@app.post("/mint", response_model=MintTokenResponse)
+@limiter.limit("30/minute")
+def mint_tokens(
+    request: Request, 
+    req: MintTokenReq, 
+    _: bool = Depends(verify_api_key)
+):
+    """
+    Mint additional one-time tokens for an existing file.
+    Requires API key if configured.
+    """
+    logger.info(f"Minting {req.count} tokens for file {req.file_id}")
+    
+    try:
+        urls = mint_additional_tokens(
+            file_id=req.file_id,
+            count=req.count,
+            ttl_sec=req.ttl_sec,
+            tag=req.tag
+        )
+        
+        effective_ttl = req.ttl_sec if req.ttl_sec is not None else ONCE_TOKEN_TTL_SEC
+        
+        logger.info(f"Successfully minted {len(urls)} tokens for file {req.file_id}")
+        return MintTokenResponse(
+            success=True,
+            file_id=req.file_id,
+            tokens_created=len(urls),
+            urls=urls,
+            expires_in_sec=effective_ttl
+        )
+        
+    except FileNotFoundError as e:
+        logger.warning(f"File not found for minting: {e}")
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error minting tokens: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to mint tokens: {str(e)}")
+
+
+@app.get("/files", response_model=ListFilesResponse)
+@limiter.limit("30/minute")
+def list_files(
+    request: Request,
+    _: bool = Depends(verify_api_key)
+):
+    """
+    List available files that can have additional tokens minted.
+    Requires API key if configured.
+    """
+    files = []
+    
+    for file_id, file_info in FILE_REGISTRY.items():
+        if os.path.exists(file_info["path"]):
+            files.append(FileInfo(
+                file_id=file_id,
+                filename=os.path.basename(file_info["path"]),
+                size=file_info["size"],
+                active_tokens=len(file_info["tokens"]),
+                created_at=datetime.fromtimestamp(file_info["created_at"]).isoformat()
+            ))
+    
+    return ListFilesResponse(
+        files=files,
+        total_files=len(files)
+    )
 
 
 @app.get("/once/{token}")
@@ -1016,19 +1247,145 @@ async def worker_job(req: DownloadReq, expected_name: str, dest: str):
                     pass
         else:
             logger.info(f"Job {req.tag}: Saving to local storage")
-            public_path = os.path.join(PUBLIC_FILES_DIR, expected_name)
-            shutil.move(out_local, public_path)
-            once_url = make_single_use_url(os.path.basename(public_path), tag=req.tag)
-            payload = {
-                "tag": req.tag,
-                "expected_name": expected_name,
-                "once_url": once_url,
-                "expires_in_sec": ONCE_TOKEN_TTL_SEC,
-                "quality": req.quality,
-                "dest": "LOCAL",
-            }
+            
+            artifacts = []
+            
+            # Check if we should try to extract separate audio/video
+            if req.separate_audio_video and dest == "LOCAL":
+                logger.info(f"Job {req.tag}: Attempting to extract separate audio/video")
+                
+                # Try to extract audio
+                audio_name = expected_name.replace(".mp4", f"_audio.{req.audio_format}")
+                audio_path = os.path.join(work_dir, audio_name)
+                
+                # Extract audio using ffmpeg
+                audio_cmd = [
+                    "ffmpeg", "-y", "-i", out_local, 
+                    "-vn", "-acodec", "copy" if req.audio_format == "m4a" else "mp3",
+                    audio_path
+                ]
+                
+                rc_audio, _, _ = await run(audio_cmd, timeout=300)
+                
+                if rc_audio == 0 and os.path.exists(audio_path):
+                    # Move audio to public directory
+                    public_audio_path = os.path.join(PUBLIC_FILES_DIR, audio_name)
+                    shutil.move(audio_path, public_audio_path)
+                    
+                    # Create tokens for audio
+                    audio_urls = make_multiple_use_urls(
+                        audio_name, 
+                        tag=f"{req.tag}_audio", 
+                        count=req.token_count or 1,
+                        ttl_sec=req.custom_ttl
+                    )
+                    
+                    artifacts.append({
+                        "type": "audio",
+                        "filename": audio_name,
+                        "urls": audio_urls,
+                        "format": req.audio_format
+                    })
+                    logger.info(f"Job {req.tag}: Audio extracted to {audio_name}")
+                
+                # Video file (remove audio if we successfully extracted it)
+                video_name = expected_name.replace(".mp4", "_video.mp4")
+                video_path = os.path.join(work_dir, video_name)
+                
+                if rc_audio == 0:
+                    # Create video-only version
+                    video_cmd = [
+                        "ffmpeg", "-y", "-i", out_local,
+                        "-an", "-vcodec", "copy",
+                        video_path
+                    ]
+                    
+                    rc_video, _, _ = await run(video_cmd, timeout=300)
+                    
+                    if rc_video == 0 and os.path.exists(video_path):
+                        # Move video to public directory
+                        public_video_path = os.path.join(PUBLIC_FILES_DIR, video_name)
+                        shutil.move(video_path, public_video_path)
+                        
+                        # Create tokens for video
+                        video_urls = make_multiple_use_urls(
+                            video_name,
+                            tag=f"{req.tag}_video",
+                            count=req.token_count or 1,
+                            ttl_sec=req.custom_ttl
+                        )
+                        
+                        artifacts.append({
+                            "type": "video",
+                            "filename": video_name,
+                            "urls": video_urls,
+                            "format": "mp4"
+                        })
+                        logger.info(f"Job {req.tag}: Video extracted to {video_name}")
+                        
+                        # Remove original combined file
+                        try:
+                            os.remove(out_local)
+                        except Exception:
+                            pass
+                    else:
+                        # Video extraction failed, fall back to combined file
+                        logger.warning(f"Job {req.tag}: Video extraction failed, using combined file")
+                        req.separate_audio_video = False
+            
+            # If not separating or if separation failed, handle as single file
+            if not req.separate_audio_video or not artifacts:
+                public_path = os.path.join(PUBLIC_FILES_DIR, expected_name)
+                shutil.move(out_local, public_path)
+                
+                # Create multiple tokens if requested
+                once_urls = make_multiple_use_urls(
+                    expected_name,
+                    tag=req.tag,
+                    count=req.token_count or 1,
+                    ttl_sec=req.custom_ttl
+                )
+                
+                artifacts.append({
+                    "type": "combined",
+                    "filename": expected_name,
+                    "urls": once_urls,
+                    "format": "mp4"
+                })
+            
+            # Prepare response payload
+            effective_ttl = req.custom_ttl if req.custom_ttl is not None else ONCE_TOKEN_TTL_SEC
+            
+            if len(artifacts) == 1 and artifacts[0]["type"] == "combined":
+                # Legacy single-file response format for backward compatibility
+                payload = {
+                    "tag": req.tag,
+                    "expected_name": expected_name,
+                    "once_url": artifacts[0]["urls"][0],  # First URL for backward compatibility
+                    "once_urls": artifacts[0]["urls"],  # All URLs
+                    "expires_in_sec": effective_ttl,
+                    "quality": req.quality,
+                    "dest": "LOCAL",
+                }
+            else:
+                # Multi-artifact response format
+                payload = {
+                    "tag": req.tag,
+                    "expected_name": expected_name,
+                    "artifacts": artifacts,
+                    "expires_in_sec": effective_ttl,
+                    "quality": req.quality,
+                    "dest": "LOCAL",
+                    "separate_audio_video": req.separate_audio_video,
+                }
+            
             job_set(req.tag, status="ready", payload=payload)
-            logger.info(f"Job {req.tag}: File ready at {once_url}")
+            
+            if len(artifacts) == 1:
+                logger.info(f"Job {req.tag}: File ready with {len(artifacts[0]['urls'])} URLs")
+            else:
+                logger.info(f"Job {req.tag}: {len(artifacts)} artifacts ready")
+            
             await safe_callback(
                 req.callback_url or "",
                 {
