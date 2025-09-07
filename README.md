@@ -7,9 +7,12 @@ A comprehensive FastAPI-based service for downloading media from various platfor
 ### Core Functionality
 - **Media Download**: Download videos/audio from 1000+ platforms using yt-dlp
 - **Multiple Quality Options**: Best original, MP4 optimized, or strict MP4 re-encoding
-- **Dual Storage**: Local storage with single-use tokens or Google Drive integration
+- **Dual Storage**: Local storage with multi-token one-time URLs or Google Drive integration
 - **Background Processing**: Asynchronous download jobs with status tracking
 - **Range Support**: HTTP range requests for efficient media streaming
+- **Multi-Token URLs**: Generate multiple one-time download tokens for the same file
+- **Smart TTL**: Configurable token expiration times with intelligent cleanup
+- **Audio+Video Artifacts**: Option to download separate audio and video files
 
 ### Security & Rate Limiting
 - **API Key Authentication**: Optional API key protection for enhanced security
@@ -87,9 +90,19 @@ Submit a download job.
   "expected_name": "video.mp4",
   "quality": "BEST_MP4",
   "dest": "LOCAL",
-  "callback_url": "https://your-webhook.com/callback"
+  "callback_url": "https://your-webhook.com/callback",
+  "separate_audio_video": false,
+  "audio_format": "m4a",
+  "token_count": 1,
+  "custom_ttl": 86400
 }
 ```
+
+**New Parameters:**
+- `separate_audio_video` (optional): Download separate audio and video files (default: false)
+- `audio_format` (optional): Audio format when separating: m4a, mp3, or best (default: m4a)
+- `token_count` (optional): Number of tokens to create per artifact, 1-5 (default: 1)
+- `custom_ttl` (optional): Custom TTL for tokens in seconds, 60s to 7 days (default: 86400)
 
 **Response:**
 ```json
@@ -107,8 +120,102 @@ Check download job status.
 #### GET /result?tag={job_tag}
 Get download job result with download links.
 
+**Single File Response (backward compatible):**
+```json
+{
+  "tag": "my-download-job",
+  "status": "ready",
+  "expected_name": "video.mp4",
+  "once_url": "/once/abc123",
+  "once_urls": ["/once/abc123", "/once/def456"],
+  "expires_in_sec": 86400,
+  "quality": "BEST_MP4",
+  "dest": "LOCAL"
+}
+```
+
+**Multi-Artifact Response (when separate_audio_video=true):**
+```json
+{
+  "tag": "my-download-job", 
+  "status": "ready",
+  "expected_name": "video.mp4",
+  "artifacts": [
+    {
+      "type": "audio",
+      "filename": "video_audio.m4a",
+      "urls": ["/once/audio1", "/once/audio2"],
+      "format": "m4a"
+    },
+    {
+      "type": "video", 
+      "filename": "video_video.mp4",
+      "urls": ["/once/video1", "/once/video2"],
+      "format": "mp4"
+    }
+  ],
+  "expires_in_sec": 86400,
+  "quality": "BEST_MP4",
+  "dest": "LOCAL",
+  "separate_audio_video": true
+}
+```
+
 #### GET /once/{token}
 Stream downloaded file (single-use, supports HTTP ranges).
+
+#### POST /mint
+Mint additional one-time tokens for an existing file.
+
+**Request Body:**
+```json
+{
+  "file_id": "file_abc12345",
+  "count": 3,
+  "ttl_sec": 7200,
+  "tag": "additional_tokens"
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "file_id": "file_abc12345",
+  "tokens_created": 3,
+  "urls": [
+    "/once/token1",
+    "/once/token2", 
+    "/once/token3"
+  ],
+  "expires_in_sec": 7200
+}
+```
+
+**Rate Limit:** 30 requests per minute  
+**Authentication:** API key required (if configured)
+
+#### GET /files
+List available files that can have additional tokens minted.
+
+**Response:**
+```json
+{
+  "files": [
+    {
+      "file_id": "file_abc12345",
+      "filename": "video.mp4",
+      "size": 15728640,
+      "active_tokens": 2,
+      "created_at": "2024-01-15T10:30:00"
+    }
+  ],
+  "total_files": 1
+}
+```
+
+**Rate Limit:** 30 requests per minute  
+**Authentication:** API key required (if configured)
 
 #### GET /discover
 Discover metadata from video sources without downloading.
@@ -196,8 +303,10 @@ Prometheus metrics (for monitoring tools).
 
 #### Download Configuration
 - `DOWNLOAD_TIMEOUT_SEC`: Download timeout in seconds (default: 5400)
-- `ONCE_TOKEN_TTL_SEC`: Single-use token TTL in seconds (default: 86400)
+- `ONCE_TOKEN_TTL_SEC`: Default single-use token TTL in seconds (default: 86400)
 - `DELETE_AFTER_SERVE`: Delete files after streaming (default: true)
+
+**Note:** Individual tokens can override the default TTL using the `custom_ttl` parameter in download requests or when minting tokens.
 
 #### Logging
 - `LOG_LEVEL`: Logging level: DEBUG, INFO, WARNING, ERROR (default: INFO)
