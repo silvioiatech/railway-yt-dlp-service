@@ -1,24 +1,30 @@
 # Railway yt-dlp Service
 
-A comprehensive FastAPI-based service for downloading media from various platforms using yt-dlp, with Google Drive integration, security features, observability, and rate limiting.
+A comprehensive FastAPI-based service for downloading media from various platforms using yt-dlp, with intent-based processing, enhanced security, Google Drive integration, and comprehensive observability.
 
 ## Features
 
 ### Core Functionality
+- **Intent-Based Downloads**: Smart processing with download, preview, and archive intents
 - **Media Download**: Download videos/audio from 1000+ platforms using yt-dlp
+- **Enhanced Validation**: Strict URL validation, parameter constraints, and error handling
 - **Multiple Quality Options**: Best original, MP4 optimized, or strict MP4 re-encoding
 - **Dual Storage**: Local storage with multi-token one-time URLs or Google Drive integration
-- **Background Processing**: Asynchronous download jobs with status tracking
+- **Background Processing**: Asynchronous download jobs with comprehensive status tracking
 - **Range Support**: HTTP range requests for efficient media streaming
 - **Multi-Token URLs**: Generate multiple one-time download tokens for the same file
-- **Smart TTL**: Configurable token expiration times with intelligent cleanup
+- **Smart TTL**: Intent-aware token expiration with configurable cleanup policies
 - **Audio+Video Artifacts**: Option to download separate audio and video files
+- **Metadata Discovery**: Enhanced /discover endpoint with stricter validation and complexity limits
 
 ### Security & Rate Limiting
 - **API Key Authentication**: Optional API key protection for enhanced security
-- **Rate Limiting**: Configurable rate limits per endpoint to prevent abuse
+- **Signed Download Links**: HMAC-SHA256 signed URLs with expiry validation for secure downloads
+- **Enhanced Rate Limiting**: Complexity-based rate limiting with configurable thresholds
 - **Security Headers**: CORS, XSS protection, content type validation
-- **Input Validation**: Comprehensive request validation and sanitization
+- **Input Validation**: Comprehensive request validation with Pydantic models
+- **Configuration Validation**: Startup validation for environment configuration
+- **Intent-Based Security**: Different security policies based on download intent
 
 ### Observability & Monitoring
 - **Structured Logging**: JSON-formatted logs with loguru
@@ -80,11 +86,12 @@ Once running, visit:
 ### Core Endpoints
 
 #### POST /download
-Submit a download job.
+Submit an intent-based download job with enhanced validation.
 
 **Request Body:**
 ```json
 {
+  "intent": "download",
   "url": "https://example.com/video",
   "tag": "my-download-job",
   "expected_name": "video.mp4",
@@ -94,15 +101,32 @@ Submit a download job.
   "separate_audio_video": false,
   "audio_format": "m4a",
   "token_count": 1,
-  "custom_ttl": 86400
+  "custom_ttl": 86400,
+  "timeout": 5400,
+  "retries": 3,
+  "socket_timeout": 30
 }
 ```
 
-**New Parameters:**
+**Intent-Based Parameters:**
+- `intent` (optional): Processing intent - "download", "preview", or "archive" (default: "download")
+  - `download`: Standard processing with 24h default TTL
+  - `preview`: Quick access with 1h max TTL, LOCAL dest only
+  - `archive`: Long-term storage with 7d default TTL, single token only
+
+**Enhanced Parameters:**
+- `url` (required): Source URL with strict validation (http/https, max 2048 chars)
+- `tag` (optional): Alphanumeric identifier with validation (max 100 chars)
+- `expected_name` (optional): Output filename with sanitization (max 255 chars)
+- `timeout` (optional): Download timeout, 60-7200 seconds (default: 5400)
+- `retries` (optional): Retry attempts per strategy, 1-10 (default: 3)
+- `socket_timeout` (optional): Socket timeout, 10-300 seconds (default: 30)
+
+**Multi-Artifact Parameters:**
 - `separate_audio_video` (optional): Download separate audio and video files (default: false)
 - `audio_format` (optional): Audio format when separating: m4a, mp3, or best (default: m4a)
 - `token_count` (optional): Number of tokens to create per artifact, 1-5 (default: 1)
-- `custom_ttl` (optional): Custom TTL for tokens in seconds, 60s to 7 days (default: 86400)
+- `custom_ttl` (optional): Custom TTL for tokens in seconds, 60s to 7 days (default: intent-based)
 
 **Response:**
 ```json
@@ -110,7 +134,7 @@ Submit a download job.
   "accepted": true,
   "tag": "my-download-job",
   "expected_name": "video.mp4",
-  "note": "processing"
+  "note": "processing with intent: download"
 }
 ```
 
@@ -118,19 +142,38 @@ Submit a download job.
 Check download job status.
 
 #### GET /result?tag={job_tag}
-Get download job result with download links.
+Get download job result with enhanced metadata and tag management.
 
-**Single File Response (backward compatible):**
+**Query Parameters:**
+- `tag` (required): Job tag identifier (validated, alphanumeric only)
+- `include_metadata` (optional): Include detailed metadata (default: false)
+- `format` (optional): Response format - "json" or "minimal" (default: "json")
+
+**Enhanced Response (with include_metadata=true):**
 ```json
 {
   "tag": "my-download-job",
   "status": "ready",
   "expected_name": "video.mp4",
-  "once_url": "/once/abc123",
-  "once_urls": ["/once/abc123", "/once/def456"],
+  "once_url": "/once/abc123?sig=f3d1a2c4&exp=1640995200",
+  "once_urls": ["/once/abc123?sig=f3d1a2c4&exp=1640995200"],
   "expires_in_sec": 86400,
   "quality": "BEST_MP4",
-  "dest": "LOCAL"
+  "dest": "LOCAL",
+  "intent": "download",
+  "created_at": 1640908800.0,
+  "updated_at": 1640912400.0,
+  "processing_duration": 3600.0
+}
+```
+
+**Minimal Response (format=minimal):**
+```json
+{
+  "tag": "my-download-job",
+  "status": "ready",
+  "once_url": "/once/abc123?sig=f3d1a2c4&exp=1640995200",
+  "expires_in_sec": 86400
 }
 ```
 
@@ -144,13 +187,13 @@ Get download job result with download links.
     {
       "type": "audio",
       "filename": "video_audio.m4a",
-      "urls": ["/once/audio1", "/once/audio2"],
+      "urls": ["/once/audio1?sig=abc123&exp=1640995200"],
       "format": "m4a"
     },
     {
       "type": "video", 
       "filename": "video_video.mp4",
-      "urls": ["/once/video1", "/once/video2"],
+      "urls": ["/once/video1?sig=def456&exp=1640995200"],
       "format": "mp4"
     }
   ],
@@ -218,22 +261,28 @@ List available files that can have additional tokens minted.
 **Authentication:** API key required (if configured)
 
 #### GET /discover
-Discover metadata from video sources without downloading.
+Enhanced metadata discovery with strict validation and complexity limits.
 
-Performs metadata discovery across one or more provided source URLs (channels, playlists, individual videos) using yt-dlp without downloading content.
+Performs metadata discovery across one or more provided source URLs (channels, playlists, individual videos) using yt-dlp without downloading content. Now includes enhanced validation and complexity-based rate limiting.
 
 **Query Parameters:**
-- `sources` (required): Comma-separated URLs to discover
-- `format` (optional): Output format - csv, json, or ndjson (default: csv)
+- `sources` (required): Comma-separated URLs to discover (max 10 sources, max 4096 chars total)
+- `format` (required): Output format - csv, json, or ndjson (strict validation)
 - `limit` (optional): Limit per source, 1-1000 (default: 100)
-- `min_views` (optional): Minimum view count filter
-- `min_duration` (optional): Minimum duration in seconds
-- `max_duration` (optional): Maximum duration in seconds
-- `dateafter` (optional): Date filter - YYYYMMDD or now-<days>days format
-- `match_filter` (optional): Raw yt-dlp match filter expression
-- `fields` (optional): CSV field list (default: id,title,url,duration,view_count,like_count,uploader,upload_date)
+- `min_views` (optional): Minimum view count filter (0 to 1B)
+- `min_duration` (optional): Minimum duration in seconds (1-86400)
+- `max_duration` (optional): Maximum duration in seconds (1-86400, must be > min_duration)
+- `dateafter` (optional): Date filter - YYYYMMDD or now-<days>days format (max 32 chars)
+- `match_filter` (optional): Raw yt-dlp match filter expression (max 512 chars)
+- `fields` (optional): CSV field list (max 512 chars, default: id,title,url,duration,view_count,like_count,uploader,upload_date)
 
-**Rate Limit:** 20 requests per minute  
+**Enhanced Validation:**
+- URLs must be http/https and max 2048 characters each
+- Complexity scoring prevents resource exhaustion (max score: 50)
+- Duration parameters validated for logical consistency
+- Format strictly validated against allowed values
+
+**Rate Limit:** 20 requests per minute + complexity-based throttling  
 **Authentication:** API key required (if configured)
 
 **Sample Request:**
@@ -285,6 +334,8 @@ Prometheus metrics (for monitoring tools).
 - `API_KEY`: Optional API key for authentication
 - `CORS_ORIGINS`: Comma-separated list of allowed CORS origins (default: *)
 - `RATE_LIMIT_REQUESTS`: Rate limit format (default: 30/minute)
+- `SIGNED_LINKS_ENABLED`: Enable signed download links (default: false)
+- `LINK_SIGNING_KEY`: 64-character hex key for signing links (required if SIGNED_LINKS_ENABLED=true)
 
 #### Google Drive Integration
 - `DRIVE_ENABLED`: Enable Google Drive: oauth or service
@@ -427,8 +478,11 @@ python app.py
 2. **HTTPS Only**: Always use HTTPS in production
 3. **CORS Configuration**: Restrict `CORS_ORIGINS` to trusted domains
 4. **Rate Limiting**: Configure appropriate rate limits
-5. **File Cleanup**: Ensure `DELETE_AFTER_SERVE=true` for security
-6. **Input Validation**: The service validates all inputs, but monitor logs
+5. **Signed Links**: Enable `SIGNED_LINKS_ENABLED=true` for enhanced download security
+6. **Link Signing Key**: Use a strong 64-character hex key for `LINK_SIGNING_KEY`
+7. **File Cleanup**: Ensure `DELETE_AFTER_SERVE=true` for security
+8. **Input Validation**: The service validates all inputs, but monitor logs
+9. **Intent-Based Access**: Use appropriate intents (preview, download, archive) for different use cases
 
 ## Contributing
 

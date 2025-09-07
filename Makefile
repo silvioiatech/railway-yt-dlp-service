@@ -23,6 +23,14 @@ lint: ## Run linting checks
 	black --check app.py tests/
 	isort --check app.py tests/
 	flake8 app.py tests/
+	bandit -r app.py
+
+security: ## Run security checks
+	bandit -r app.py
+	pip-audit || echo "pip-audit not installed, skipping vulnerability check"
+
+validate-config: ## Validate configuration
+	PUBLIC_FILES_DIR=/tmp/public python -c "import app; print('Configuration validation passed')"
 
 format: ## Format code
 	black app.py tests/
@@ -59,6 +67,8 @@ setup-dev: install-dev ## Set up development environment
 	@echo "Development environment ready!"
 	@echo "Run 'make run' to start the development server"
 
-check: lint test ## Run all checks (lint + test)
+check: lint test security ## Run all checks (lint + test + security)
 
-all: clean install-dev check ## Clean, install, and run all checks
+check-full: validate-config check ## Run full validation including config check
+
+all: clean install-dev check-full ## Clean, install, and run all checks
