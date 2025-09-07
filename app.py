@@ -1,6 +1,8 @@
 import asyncio
 import base64
 import csv
+import hashlib
+import hmac
 import io
 import json
 import os
@@ -22,7 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from loguru import logger
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
@@ -37,6 +39,14 @@ APP_PORT = int(os.getenv("PORT", "8000"))
 API_KEY = os.getenv("API_KEY", "")  # Optional API key protection
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
 RATE_LIMIT_REQUESTS = os.getenv("RATE_LIMIT_REQUESTS", "30/minute")
+
+# Signed links configuration
+SIGNED_LINKS_ENABLED = os.getenv("SIGNED_LINKS_ENABLED", "false").lower() == "true"
+LINK_SIGNING_KEY = os.getenv("LINK_SIGNING_KEY", "").strip()
+if SIGNED_LINKS_ENABLED and not LINK_SIGNING_KEY:
+    import secrets
+    LINK_SIGNING_KEY = secrets.token_hex(32)
+    logger.warning("SIGNED_LINKS_ENABLED but no LINK_SIGNING_KEY provided, using random key (not persistent)")
 
 # Destination selection
 DEFAULT_DEST = (os.getenv("DEFAULT_DEST") or "LOCAL").upper()  # "LOCAL" or "DRIVE"
@@ -159,9 +169,38 @@ async def safe_callback(url: str, payload: dict):
 
 
 def job_set(tag: str, **kw):
+    """Enhanced job metadata management with TTL tracking"""
     rec = JOBS.get(tag, {"tag": tag})
+    
+    # Set creation timestamp if this is a new job
+    if "tag" not in rec or not rec.get("created_at"):
+        rec["created_at"] = time.time()
+    
     rec.update(kw)
-    rec["updated_at"] = datetime.utcnow().isoformat()
+    rec["updated_at"] = time.time()
+    
+    # Enhanced TTL metadata
+    if "status" in kw:
+        status = kw["status"]
+        rec[f"status_{status}_at"] = time.time()
+        
+        # Set TTL based on status and intent
+        intent = rec.get("intent", "download")
+        if status == "ready":
+            # Different TTL based on intent
+            default_ttl = {
+                "preview": 3600,      # 1 hour for previews
+                "download": 86400,    # 24 hours for downloads  
+                "archive": 604800     # 7 days for archives
+            }.get(intent, 86400)
+            
+            rec["ttl_sec"] = rec.get("custom_ttl") or default_ttl
+            rec["expires_at"] = time.time() + rec["ttl_sec"]
+        elif status == "error":
+            # Short TTL for error jobs to cleanup quickly
+            rec["ttl_sec"] = 3600  # 1 hour
+            rec["expires_at"] = time.time() + rec["ttl_sec"]
+    
     JOBS[tag] = rec
 
 
@@ -262,10 +301,42 @@ def _file_stat(path: str) -> tuple[int, str]:
     return (p.stat().st_size, p.name)
 
 
-def _build_once_url(token: str) -> str:
-    if not PUBLIC_BASE_URL:
-        return f"/once/{token}"
-    return f"{PUBLIC_BASE_URL}/once/{token}"
+def _generate_signature(token: str, expiry: float) -> str:
+    """Generate HMAC signature for signed links"""
+    if not SIGNED_LINKS_ENABLED or not LINK_SIGNING_KEY:
+        return ""
+    
+    import hmac
+    import hashlib
+    
+    message = f"{token}:{int(expiry)}"
+    signature = hmac.new(
+        LINK_SIGNING_KEY.encode(),
+        message.encode(),
+        hashlib.sha256
+    ).hexdigest()[:16]  # Truncate to 16 chars for shorter URLs
+    
+    return signature
+
+
+def _verify_signature(token: str, expiry: float, signature: str) -> bool:
+    """Verify HMAC signature for signed links"""
+    if not SIGNED_LINKS_ENABLED or not LINK_SIGNING_KEY:
+        return True  # Skip verification if signing is disabled
+    
+    expected_signature = _generate_signature(token, expiry)
+    return hmac.compare_digest(signature, expected_signature)
+
+
+def _build_once_url(token: str, expiry: Optional[float] = None) -> str:
+    """Build download URL with optional signature"""
+    base_url = f"/once/{token}" if not PUBLIC_BASE_URL else f"{PUBLIC_BASE_URL}/once/{token}"
+    
+    if SIGNED_LINKS_ENABLED and expiry:
+        signature = _generate_signature(token, expiry)
+        return f"{base_url}?sig={signature}&exp={int(expiry)}"
+    
+    return base_url
 
 
 def make_single_use_url(filename: str, tag: str, ttl_sec: Optional[int] = None) -> str:
@@ -303,7 +374,7 @@ def make_single_use_url(filename: str, tag: str, ttl_sec: Optional[int] = None) 
     # Link token to file
     FILE_REGISTRY[file_id]["tokens"].add(token)
     
-    return _build_once_url(token)
+    return _build_once_url(token, time.time() + effective_ttl)
 
 
 def make_multiple_use_urls(filename: str, tag: str, count: int = 1, ttl_sec: Optional[int] = None) -> List[str]:
@@ -349,7 +420,7 @@ def mint_additional_tokens(file_id: str, count: int = 1, ttl_sec: Optional[int] 
             "file_id": file_id,
         }
         FILE_REGISTRY[file_id]["tokens"].add(token)
-        urls.append(_build_once_url(token))
+        urls.append(_build_once_url(token, time.time() + effective_ttl))
     
     return urls
 
@@ -386,11 +457,12 @@ def _maybe_delete_and_purge(token: str):
 
 
 def _janitor_loop():
-    """Enhanced janitor loop for cleaning up expired tokens and orphaned files"""
+    """Enhanced janitor loop for cleaning up expired tokens, orphaned files, and stale jobs"""
     while True:
         try:
             now = time.time()
             expired_tokens = []
+            expired_jobs = []
             
             # Find expired tokens
             for token, meta in list(ONCE_TOKENS.items()):
@@ -434,8 +506,43 @@ def _janitor_loop():
                     except Exception as e:
                         logger.error(f"Failed to delete orphaned file {file_info['path']}: {e}")
             
-            if expired_tokens or orphaned_files:
-                logger.info(f"Janitor cleaned up {len(expired_tokens)} expired tokens and {len(orphaned_files)} orphaned files")
+            # Enhanced job cleanup with TTL awareness
+            for tag, job in list(JOBS.items()):
+                should_expire = False
+                
+                # Check explicit expiry time
+                if job.get("expires_at") and now > job["expires_at"]:
+                    should_expire = True
+                    logger.debug(f"Job {tag} expired based on TTL")
+                
+                # Check age-based cleanup for stale jobs
+                created_at = job.get("created_at", 0)
+                age_hours = (now - created_at) / 3600 if created_at else 0
+                
+                status = job.get("status", "queued")
+                max_age_hours = {
+                    "queued": 24,     # 1 day for queued jobs
+                    "processing": 48, # 2 days for processing jobs
+                    "ready": 168,     # 7 days for ready jobs (unless TTL is shorter)
+                    "error": 24,      # 1 day for error jobs
+                }.get(status, 24)
+                
+                if age_hours > max_age_hours:
+                    should_expire = True
+                    logger.debug(f"Job {tag} expired based on age: {age_hours:.1f} hours")
+                
+                if should_expire:
+                    expired_jobs.append(tag)
+            
+            # Remove expired jobs
+            for tag in expired_jobs:
+                job = JOBS.pop(tag, None)
+                if job:
+                    logger.info(f"Cleaned up expired job: {tag} (status: {job.get('status')}, intent: {job.get('intent')})")
+            
+            # Summary logging
+            if expired_tokens or orphaned_files or expired_jobs:
+                logger.info(f"Janitor cleanup: {len(expired_tokens)} tokens, {len(orphaned_files)} files, {len(expired_jobs)} jobs")
                 
         except Exception as e:
             logger.error(f"Janitor loop error: {e}")
@@ -640,23 +747,55 @@ def metrics(request: Request):
 # Models
 # =========================
 class DownloadReq(BaseModel):
-    url: str
-    tag: Optional[str] = Field(default_factory=lambda: f"job_{uuid.uuid4().hex[:8]}")
-    expected_name: Optional[str] = None
-    callback_url: Optional[str] = None
-    quality: Literal["BEST_ORIGINAL", "BEST_MP4", "STRICT_MP4_REENC"] = "BEST_MP4"
-    timeout: Optional[int] = DOWNLOAD_TIMEOUT
-    dest: Optional[Literal["LOCAL", "DRIVE"]] = None
-    drive_folder: Optional[str] = None
+    # Intent-based processing
+    intent: Literal["download", "preview", "archive"] = Field("download", description="Download intent")
+    url: str = Field(..., description="Source URL to download")
+    tag: Optional[str] = Field(default_factory=lambda: f"job_{uuid.uuid4().hex[:8]}", description="Unique job identifier")
+    expected_name: Optional[str] = Field(None, max_length=255, description="Expected output filename")
+    callback_url: Optional[str] = Field(None, description="Webhook URL for completion notification")
+    quality: Literal["BEST_ORIGINAL", "BEST_MP4", "STRICT_MP4_REENC"] = Field("BEST_MP4", description="Output quality preference")
+    timeout: Optional[int] = Field(DOWNLOAD_TIMEOUT, ge=60, le=7200, description="Download timeout in seconds")
+    dest: Optional[Literal["LOCAL", "DRIVE"]] = Field(None, description="Storage destination")
+    drive_folder: Optional[str] = Field(None, description="Google Drive folder ID")
     # hardening knobs
-    retries: Optional[int] = 3  # times per strategy
-    socket_timeout: Optional[int] = 30  # yt-dlp --socket-timeout
-    prefer_api: Optional[bool] = True  # try rumble:use_api first
+    retries: Optional[int] = Field(3, ge=1, le=10, description="Retry attempts per strategy")
+    socket_timeout: Optional[int] = Field(30, ge=10, le=300, description="Socket timeout in seconds")
+    prefer_api: Optional[bool] = Field(True, description="Prefer API over scraping")
     # multi-artifact support
-    separate_audio_video: Optional[bool] = False  # download separate audio/video files
-    audio_format: Optional[Literal["m4a", "mp3", "best"]] = "m4a"
-    token_count: Optional[int] = Field(1, ge=1, le=5)  # number of tokens to create per artifact
-    custom_ttl: Optional[int] = Field(None, ge=60, le=604800)  # custom TTL for tokens
+    separate_audio_video: Optional[bool] = Field(False, description="Download audio/video as separate files")
+    audio_format: Optional[Literal["m4a", "mp3", "best"]] = Field("m4a", description="Audio format preference")
+    token_count: Optional[int] = Field(1, ge=1, le=5, description="Number of download tokens per artifact")
+    custom_ttl: Optional[int] = Field(None, ge=60, le=604800, description="Custom TTL for tokens in seconds")
+    
+    # Enhanced validation
+    @field_validator('url')
+    @classmethod
+    def validate_url(cls, v: str) -> str:
+        """Validate URL format and prevent obviously malicious URLs"""
+        # Don't validate empty strings here - let endpoint handle for backward compatibility
+        if v and v.strip():
+            v = v.strip()
+            if not (v.startswith('http://') or v.startswith('https://')):
+                raise ValueError("URL must start with http:// or https://")
+            if len(v) > 2048:
+                raise ValueError("URL too long (max 2048 characters)")
+        return v
+    
+    @field_validator('tag')
+    @classmethod
+    def validate_tag(cls, v: Optional[str]) -> Optional[str]:
+        """Validate tag format"""
+        if v is not None:
+            v = v.strip()
+            if not v:
+                return None
+            if len(v) > 100:
+                raise ValueError("Tag too long (max 100 characters)")
+            # Allow alphanumeric, dash, underscore only
+            import re
+            if not re.match(r'^[a-zA-Z0-9_-]+$', v):
+                raise ValueError("Tag can only contain letters, numbers, dashes, and underscores")
+        return v
 
 
 class DownloadAck(BaseModel):
@@ -702,30 +841,70 @@ class ListFilesResponse(BaseModel):
 async def download(
     request: Request, req: DownloadReq, bg: BackgroundTasks, _: bool = Depends(verify_api_key)
 ):
-    """Download media from URL"""
-    logger.info(f"Download request: {req.url} with tag {req.tag}")
+    """Intent-based media download from URL with enhanced validation"""
+    logger.info(f"Download request: intent={req.intent}, url={req.url}, tag={req.tag}")
 
-    if not req.url or not isinstance(req.url, str):
+    # Backward-compatible URL validation for empty strings
+    if not req.url or not req.url.strip():
         raise HTTPException(status_code=400, detail="Missing url")
 
-    # resolve filename
-    expected = req.expected_name or f"{req.tag}.mp4"
+    # Intent-based validation
+    if req.intent == "preview" and req.separate_audio_video:
+        raise HTTPException(status_code=400, detail="Preview intent cannot use separate_audio_video")
+    
+    if req.intent == "archive" and req.token_count > 1:
+        raise HTTPException(status_code=400, detail="Archive intent should use single token")
+
+    # Enhanced URL validation (Pydantic validator already ran)
+    url = req.url.strip()
+    
+    # Additional intent-specific validation
+    if req.intent == "preview" and req.custom_ttl and req.custom_ttl > 3600:
+        raise HTTPException(status_code=400, detail="Preview intent TTL cannot exceed 1 hour")
+
+    # resolve filename with intent context
+    if req.expected_name:
+        expected = sanitize_filename(req.expected_name)
+    else:
+        # Intent-based filename generation
+        prefix = {"preview": "preview_", "archive": "archive_", "download": ""}.get(req.intent, "")
+        expected = f"{prefix}{req.tag}.mp4"
+    
     expected = sanitize_filename(expected)
     if not expected.lower().endswith(".mp4"):
         expected += ".mp4"
 
-    # pick destination
+    # pick destination with intent awareness
     dest = (req.dest or DEFAULT_DEST).upper()
     if dest == "DRIVE" and not DRIVE_ENABLED:
         raise HTTPException(
             status_code=400, detail="Drive not configured; use LOCAL or enable Drive"
         )
 
-    job_set(req.tag, status="queued", expected_name=expected, dest=dest)
+    # Intent-specific constraints
+    if req.intent == "preview" and dest == "DRIVE":
+        raise HTTPException(status_code=400, detail="Preview intent must use LOCAL destination")
+
+    # Enhanced job metadata with intent
+    job_metadata = {
+        "status": "queued", 
+        "expected_name": expected, 
+        "dest": dest,
+        "intent": req.intent,
+        "created_at": time.time(),
+        "url_hash": hash(url) & 0x7FFFFFFF,  # For tracking
+    }
+    
+    job_set(req.tag, **job_metadata)
     bg.add_task(worker_job, req, expected, dest)
 
-    logger.info(f"Download job queued: {req.tag}")
-    return DownloadAck(accepted=True, tag=req.tag, expected_name=expected, note="processing")
+    logger.info(f"Download job queued: {req.tag} (intent: {req.intent})")
+    return DownloadAck(
+        accepted=True, 
+        tag=req.tag, 
+        expected_name=expected, 
+        note=f"processing with intent: {req.intent}"
+    )
 
 
 @app.get("/status")
@@ -740,25 +919,94 @@ def get_status(request: Request, tag: str = Query(...)):
 
 @app.get("/result")
 @limiter.limit("30/minute")
-def get_result(request: Request, tag: str = Query(...)):
-    """Get download job result"""
+def get_result(
+    request: Request, 
+    tag: str = Query(..., min_length=1, max_length=100, description="Job tag identifier"),
+    include_metadata: bool = Query(False, description="Include additional metadata"),
+    format: str = Query("json", description="Response format: json or minimal")
+):
+    """Get download job result with enhanced tag management and metadata"""
+    
+    # Enhanced tag validation
+    import re
+    if not re.match(r'^[a-zA-Z0-9_-]+$', tag):
+        raise HTTPException(status_code=400, detail="Invalid tag format")
+    
     rec = JOBS.get(tag)
     if not rec:
         return JSONResponse({"tag": tag, "status": "unknown"}, status_code=404)
+    
     st = rec.get("status")
     payload = rec.get("payload") or {}
+    
+    # Base response structure
+    response_data = {
+        "tag": tag,
+        "status": st or "queued"
+    }
+    
+    # Add enhanced metadata if requested
+    if include_metadata:
+        response_data.update({
+            "intent": rec.get("intent", "download"),
+            "created_at": rec.get("created_at"),
+            "updated_at": rec.get("updated_at"),
+            "dest": rec.get("dest"),
+            "url_hash": rec.get("url_hash"),
+        })
+        
+        # Add timing metadata if available
+        if rec.get("created_at") and rec.get("updated_at"):
+            response_data["processing_duration"] = rec.get("updated_at") - rec.get("created_at")
+    
     if st == "ready":
-        return JSONResponse({"tag": tag, "status": "ready", **payload}, status_code=200)
-    if st == "error":
-        return JSONResponse(
-            {
+        result_data = {"tag": tag, "status": "ready", **payload}
+        if include_metadata:
+            result_data.update({
+                "intent": rec.get("intent", "download"),
+                "created_at": rec.get("created_at"),
+                "updated_at": rec.get("updated_at"),
+                "dest": rec.get("dest"),
+            })
+        
+        # Track result access for analytics
+        access_count = rec.get("access_count", 0) + 1
+        rec["access_count"] = access_count
+        rec["last_accessed"] = time.time()
+        
+        # Minimal format option
+        if format == "minimal":
+            minimal_data = {
                 "tag": tag,
-                "status": "error",
-                "error_message": payload.get("error_message", "unknown"),
-            },
-            status_code=500,
-        )
-    return JSONResponse({"tag": tag, "status": st or "queued"}, status_code=202)
+                "status": "ready",
+                "once_url": payload.get("once_url"),
+                "expires_in_sec": payload.get("expires_in_sec")
+            }
+            return JSONResponse(minimal_data, status_code=200)
+            
+        return JSONResponse(result_data, status_code=200)
+        
+    if st == "error":
+        error_data = {
+            "tag": tag,
+            "status": "error",
+            "error_message": payload.get("error_message", "unknown"),
+        }
+        if include_metadata:
+            error_data.update({
+                "intent": rec.get("intent", "download"),
+                "created_at": rec.get("created_at"),
+                "error_at": rec.get("updated_at"),
+                "dest": rec.get("dest"),
+            })
+        return JSONResponse(error_data, status_code=500)
+    
+    # For queued/processing status
+    if include_metadata:
+        response_data["dest"] = rec.get("dest")
+        response_data["expected_name"] = rec.get("expected_name")
+        
+    return JSONResponse(response_data, status_code=202)
 
 
 @app.post("/mint", response_model=MintTokenResponse)
@@ -832,13 +1080,30 @@ def list_files(
 @app.get("/once/{token}")
 @limiter.limit("30/minute")
 def serve_single_use(
-    request: Request, token: str, range_header: Optional[str] = Header(default=None, alias="Range")
+    request: Request, 
+    token: str, 
+    range_header: Optional[str] = Header(default=None, alias="Range"),
+    sig: Optional[str] = Query(None, description="Signature for signed links"),
+    exp: Optional[int] = Query(None, description="Expiry timestamp for signed links")
 ):
     """
-    Streams the file ONCE (supports Range). After all concurrent streams finish,
-    the file is deleted and the token is invalidated.
+    Streams the file ONCE (supports Range) with optional signature verification.
+    After all concurrent streams finish, the file is deleted and the token is invalidated.
     """
     logger.info(f"Serving single-use file with token: {token}")
+
+    # Signature verification for signed links
+    if SIGNED_LINKS_ENABLED:
+        if not sig or not exp:
+            raise HTTPException(status_code=400, detail="Missing signature or expiry for signed link")
+        
+        # Check expiry
+        if time.time() > exp:
+            raise HTTPException(status_code=410, detail="Signed link expired")
+        
+        # Verify signature
+        if not _verify_signature(token, exp, sig):
+            raise HTTPException(status_code=403, detail="Invalid signature")
 
     meta = ONCE_TOKENS.get(token)
     if not meta:
@@ -914,30 +1179,51 @@ def serve_single_use(
 @limiter.limit("20/minute")
 async def discover(
     request: Request,
-    sources: str = Query(..., description="Comma-separated URLs"),
+    sources: str = Query(..., description="Comma-separated URLs", max_length=4096),
     format: str = Query("csv", description="Output format: csv, json, or ndjson"),
     limit: int = Query(100, ge=1, le=1000, description="Limit per source (1-1000)"),
-    min_views: Optional[int] = Query(None, ge=0, description="Minimum view count"),
-    min_duration: Optional[int] = Query(None, ge=0, description="Minimum duration in seconds"),
-    max_duration: Optional[int] = Query(None, ge=0, description="Maximum duration in seconds"),
-    dateafter: Optional[str] = Query(None, description="Date filter: YYYYMMDD or now-<days>days"),
-    match_filter: Optional[str] = Query(None, description="Raw yt-dlp match filter expression"),
-    fields: Optional[str] = Query(None, description="CSV field list"),
+    min_views: Optional[int] = Query(None, ge=0, le=1_000_000_000, description="Minimum view count"),
+    min_duration: Optional[int] = Query(None, ge=1, le=86400, description="Minimum duration in seconds (1-86400)"),
+    max_duration: Optional[int] = Query(None, ge=1, le=86400, description="Maximum duration in seconds (1-86400)"),
+    dateafter: Optional[str] = Query(None, max_length=32, description="Date filter: YYYYMMDD or now-<days>days"),
+    match_filter: Optional[str] = Query(None, max_length=512, description="Raw yt-dlp match filter expression"),
+    fields: Optional[str] = Query(None, max_length=512, description="CSV field list"),
     filename_hint: Optional[str] = Query(None, description="Ignored, for symmetry"),
     _: bool = Depends(verify_api_key),
 ):
-    """Discover metadata from one or more video sources without downloading."""
+    """Discover metadata from one or more video sources without downloading (stricter validation)."""
 
-    # Validate sources
+    # Enhanced source validation
     source_urls = [url.strip() for url in sources.split(",") if url.strip()]
     if not source_urls:
         raise HTTPException(status_code=400, detail="No valid sources provided")
+    
+    if len(source_urls) > 10:
+        raise HTTPException(status_code=400, detail="Too many sources (max 10)")
+    
+    # Validate each URL
+    for i, url in enumerate(source_urls):
+        if len(url) > 2048:
+            raise HTTPException(status_code=400, detail=f"URL {i+1} too long (max 2048 characters)")
+        if not (url.startswith('http://') or url.startswith('https://')):
+            raise HTTPException(status_code=400, detail=f"URL {i+1} must start with http:// or https://")
 
-    # Validate format
-    if format not in ("csv", "json", "ndjson"):
-        format = "csv"  # Default to csv for invalid formats
+    # Stricter format validation
+    valid_formats = {"csv", "json", "ndjson"}
+    if format not in valid_formats:
+        raise HTTPException(status_code=400, detail=f"Invalid format. Must be one of: {', '.join(valid_formats)}")
 
-    logger.info(f"Discover request: {len(source_urls)} sources, format={format}, limit={limit}")
+    # Duration validation logic
+    if min_duration is not None and max_duration is not None:
+        if min_duration >= max_duration:
+            raise HTTPException(status_code=400, detail="min_duration must be less than max_duration")
+
+    # Rate limiting based on complexity
+    complexity_score = len(source_urls) * (limit / 100)
+    if complexity_score > 50:  # Arbitrary complexity threshold
+        raise HTTPException(status_code=429, detail="Request too complex, reduce sources or limit")
+
+    logger.info(f"Discover request: {len(source_urls)} sources, format={format}, limit={limit} (complexity: {complexity_score:.1f})")
 
     all_videos = []
     seen_ids = set()
