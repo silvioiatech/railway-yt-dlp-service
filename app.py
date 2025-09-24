@@ -35,6 +35,7 @@ from process import StreamingPipeline
 # =========================
 # Configuration
 # =========================
+# CodeRabbit analysis trigger
 
 # Core settings
 API_KEY = os.getenv("API_KEY", "")
