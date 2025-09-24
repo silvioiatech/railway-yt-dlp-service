@@ -1,8 +1,8 @@
-# yt-dlp Streaming Service# Railway yt-dlp Service
+# Railway YT-DLP Service# Railway yt-dlp Service
 
 
 
-A production-ready service that downloads videos using yt-dlp and streams them directly to object storage using rclone, with no temporary files.A comprehensive FastAPI-based service for downloading media from various platforms using yt-dlp, with intent-based processing, enhanced security, Google Drive integration, and comprehensive observability.
+A fast, secure, and scalable YouTube downloader API service built with FastAPI and yt-dlp, optimized for Railway deployment with automatic file cleanup.A production-ready FastAPI service for downloading media from various platforms using yt-dlp, with Railway storage and automatic file cleanup.
 
 
 
@@ -10,236 +10,529 @@ A production-ready service that downloads videos using yt-dlp and streams them d
 
 
 
-- 🚀 **Zero-disk streaming**: Direct pipe from yt-dlp to rclone### Core Functionality
+- **High Performance**: FastAPI-powered REST API with concurrent downloads### Core Functionality
 
-- 🗄️ **Multi-cloud support**: S3, GCS, Azure, Backblaze, and more via rclone- **Intent-Based Downloads**: Smart processing with download, preview, and archive intents
+- **Railway Storage**: Direct file storage on Railway mounted volumes- **Media Download**: Download videos/audio from 1000+ platforms using yt-dlp
 
-- 📊 **Observability**: Prometheus metrics, structured logging, health checks- **Media Download**: Download videos/audio from 1000+ platforms using yt-dlp
+- **Auto Cleanup**: Files automatically deleted after 1 hour to manage storage- **Railway Storage**: Direct file storage on Railway with automatic cleanup
 
-- 🔒 **Security**: API key authentication, rate limiting, domain allowlists- **Enhanced Validation**: Strict URL validation, parameter constraints, and error handling
+- **Secure Downloads**: API key authentication and path validation- **Auto-Deletion**: Files automatically deleted after 1 hour
 
-- ⚡ **Performance**: Concurrent workers, configurable timeouts- **Multiple Quality Options**: Best original, MP4 optimized, or strict MP4 re-encoding
+- **Multiple Formats**: Support for various video/audio formats via yt-dlp- **Secure File Serving**: Protected file access with path validation
 
-- 🔄 **Robust**: Graceful shutdown, process cleanup, error handling- **Dual Storage**: Local storage with multi-token one-time URLs or Google Drive integration
+- **File Serving**: Secure file serving with auto-generated download URLs- **Multiple Formats**: Support for various video/audio quality options
 
-- **Background Processing**: Asynchronous download jobs with comprehensive status tracking
+- **Health Monitoring**: Built-in health checks and request logging
 
-## Quick Start- **Range Support**: HTTP range requests for efficient media streaming
+- **Production Ready**: Optimized for Railway deployment### Security & Performance
 
-- **Multi-Token URLs**: Generate multiple one-time download tokens for the same file
+- **API Key Authentication**: Secure access control
 
-### 1. Configure rclone- **Smart TTL**: Intent-aware token expiration with configurable cleanup policies
+## Architecture- **Rate Limiting**: Configurable request rate limits
 
-- **Audio+Video Artifacts**: Option to download separate audio and video files
+- **Input Validation**: Comprehensive request validation
 
-First, set up your object storage backend:- **Metadata Discovery**: Enhanced /discover endpoint with stricter validation and complexity limits
+This service downloads media files directly to Railway's mounted storage volumes and serves them via secure URLs. Files are automatically cleaned up after 1 hour to prevent storage overflow.- **Background Processing**: Asynchronous download jobs
 
+- **Centralized Scheduler**: Efficient file deletion management
 
-
-```bash### Security & Rate Limiting
-
-# Configure a remote (example: S3)- **API Key Authentication**: Optional API key protection for enhanced security
-
-rclone config- **Signed Download Links**: HMAC-SHA256 signed URLs with expiry validation for secure downloads
-
-- **Enhanced Rate Limiting**: Complexity-based rate limiting with configurable thresholds
-
-# Test your configuration- **Security Headers**: CORS, XSS protection, content type validation
-
-rclone ls myremote:- **Input Validation**: Comprehensive request validation with Pydantic models
-
-```- **Configuration Validation**: Startup validation for environment configuration
-
-- **Intent-Based Security**: Different security policies based on download intent
-
-### 2. Set environment variables
-
-### Observability & Monitoring
-
-```bash- **Structured Logging**: JSON-formatted logs with loguru
-
-cp .env.example .env- **Prometheus Metrics**: Built-in metrics endpoint for monitoring
-
-# Edit .env with your settings- **Health Checks**: Enhanced health check with dependency validation
-
-```- **Request Tracing**: Automatic request/response logging with timing
+### Components- **Domain Allowlists**: Optional domain restrictions
 
 
 
-### 3. Run with Docker Compose### Configuration
+- **FastAPI Application**: REST API server### Production Ready
 
-- **Environment Variables**: Full configuration via environment variables
+- **yt-dlp Pipeline**: Media download processor- **Health Checks**: Comprehensive health monitoring
 
-```bash- **Development Mode**: Easy setup for local development
+- **File Deletion Scheduler**: Centralized cleanup management- **Prometheus Metrics**: Built-in observability
 
-make dev- **Production Ready**: Optimized for production deployment
+- **Storage Manager**: Railway volume integration- **Structured Logging**: Detailed logging with configurable levels
+
+- **Graceful Shutdown**: Clean process termination
+
+## Quick Start- **Error Handling**: Robust error recovery
+
+
+
+### Railway Deployment (Recommended)## Quick Start
+
+
+
+1. **Fork/Clone** this repository### 1. Environment Setup
+
+2. **Create Railway Project** and connect your repository
+
+3. **Add Railway Volume**:Copy the environment template and configure:
+
+   - Go to Railway dashboard → Your project → Storage
+
+   - Create a new Volume and mount it to `/app/data````bash
+
+4. **Set Environment Variables**:cp .env.example .env
+
+   ``````
+
+   API_KEY=your-secure-api-key-here
+
+   STORAGE_DIR=/app/dataEdit `.env` with your settings:
+
+   PUBLIC_BASE_URL=https://your-app.railway.app
+
+   ``````bash
+
+5. **Deploy**: Railway will automatically build and deploy# Required Configuration
+
+API_KEY=your-secret-api-key-here
+
+### Local DevelopmentALLOW_YT_DOWNLOADS=false
+
+
+
+1. **Install Dependencies**:# Railway Storage Configuration
+
+   ```bashSTORAGE_DIR=/app/data  # Mount Railway Volume here
+
+   pip install -r requirements.txtPUBLIC_BASE_URL=https://your-app-name.up.railway.app
+
+   ``````
+
+
+
+2. **Set Environment Variables**:### 2. Railway Deployment
+
+   ```bash
+
+   cp .env.example .env1. **Create Railway Volume**:
+
+   # Edit .env with your settings   - Go to Railway dashboard → Your project → Variables
+
+   ```   - Create a new Volume and mount it to `/app/data`
+
+
+
+3. **Run the Service**:2. **Set Environment Variables**:
+
+   ```bash   - `API_KEY`: Generate a secure API key
+
+   python app.py   - `STORAGE_DIR`: Set to `/app/data` (or your volume mount path)
+
+   ```   - `PUBLIC_BASE_URL`: Set to your Railway app URL
+
+
+
+The service starts on `http://localhost:8080`3. **Deploy**: Railway will automatically deploy from your Git repository
+
+
+
+## API Reference### 3. Local Development
+
+
+
+### Authentication```bash
+
+# Install dependencies
+
+All API endpoints require authentication via the `X-API-Key` header:pip install -r requirements.txt
+
+
+
+```bash# Install yt-dlp
+
+curl -H "X-API-Key: your-secret-api-key-here" ...pip install yt-dlp
 
 ```
 
-## Quick Start
+# Run the service
 
-### 4. Test the service
-
-### Prerequisites
-
-```bash- Python 3.12+
-
-# Health check- ffmpeg (for video processing)
-
-curl http://localhost:8080/healthz- yt-dlp (installed via requirements.txt)
-
-
-
-# Create a download job### Installation
-
-curl -X POST http://localhost:8080/download \
-
-  -H "X-API-Key: your-secret-api-key-here" \1. Clone the repository:
-
-  -H "Content-Type: application/json" \```bash
-
-  -d '{git clone <repository-url>
-
-    "url": "https://example.com/video",cd railway-yt-dlp-service
-
-    "remote": "s3",```
-
-    "path": "videos/{safe_title}-{id}.{ext}",
-
-    "format": "bv*+ba/best"2. Install dependencies:
-
-  }'```bash
-
-pip install -r requirements.txt
-
-# Check job status```
-
-curl http://localhost:8080/downloads/{request_id}
-
-```3. Set up environment (optional):
-
-```bash
-
-## API Referencecp .env.example .env
-
-# Edit .env with your configuration
-
-### POST /download```
-
-
-
-Create a new download job.4. Run the service:
-
-```bash
-
-**Headers:**python app.py
-
-- `X-API-Key`: Required API key```
-
-- `Content-Type: application/json`
-
-The service will start on `http://localhost:8000`
-
-**Request Body:**
-
-```json### Docker Deployment
-
-{
-
-  "url": "https://example.com/video",```bash
-
-  "dest": "BUCKET",docker build -t railway-yt-dlp-service .
-
-  "remote": "s3",docker run -p 8000:8000 -e PUBLIC_FILES_DIR=/app/public railway-yt-dlp-service
-
-  "path": "videos/{safe_title}-{id}.{ext}",```
-
-  "format": "bv*+ba/best",
-
-  "webhook": "https://your-app.com/webhook",## API Documentation
-
-  "headers": {
-
-    "Content-Type": "video/mp4"Once running, visit:
-
-  },- **Interactive API Docs**: http://localhost:8000/docs
-
-  "cookies": "session=abc123",- **ReDoc Documentation**: http://localhost:8000/redoc
-
-  "timeout_sec": 1800
-
-}### Core Endpoints
+### Endpointspython app.py
 
 ```
 
 #### POST /download
 
-**Response:**Submit an intent-based download job with enhanced validation.
+The service will start on `http://localhost:8080`
+
+Create a new download job.
+
+- **Intent-Based Security**: Different security policies based on download intent
+
+**Request:**
+
+```json### 2. Set environment variables
+
+{
+
+  "url": "https://www.youtube.com/watch?v=example",### Observability & Monitoring
+
+  "format": "best",
+
+  "filename_template": "{title}-{id}.{ext}"```bash- **Structured Logging**: JSON-formatted logs with loguru
+
+}
+
+```cp .env.example .env- **Prometheus Metrics**: Built-in metrics endpoint for monitoring
+
+
+
+**Response:**# Edit .env with your settings- **Health Checks**: Enhanced health check with dependency validation
 
 ```json
 
+{```- **Request Tracing**: Automatic request/response logging with timing
+
+  "request_id": "abc123",
+
+  "status": "processing",
+
+  "message": "Download started"
+
+}### 3. Run with Docker Compose### Configuration
+
+```
+
+- **Environment Variables**: Full configuration via environment variables
+
+#### GET /downloads/{request_id}
+
+```bash- **Development Mode**: Easy setup for local development
+
+Check download job status.
+
+make dev- **Production Ready**: Optimized for production deployment
+
+**Response (Processing):**
+
+```json```
+
+{
+
+  "request_id": "abc123",## Quick Start
+
+  "status": "processing",
+
+  "message": "Download in progress"### 4. Test the service
+
+}
+
+```### Prerequisites
+
+
+
+**Response (Complete):**```bash- Python 3.12+
+
+```json
+
+{# Health check- ffmpeg (for video processing)
+
+  "request_id": "abc123",
+
+  "status": "completed",curl http://localhost:8080/healthz- yt-dlp (installed via requirements.txt)
+
+  "message": "Download completed",
+
+  "file_url": "https://your-app.railway.app/files/path/to/video.mp4",
+
+  "file_size": 15728640,
+
+  "expires_at": "2024-01-01T13:00:00Z"# Create a download job### Installation
+
+}
+
+```curl -X POST http://localhost:8080/download \
+
+
+
+#### GET /files/{path:path}  -H "X-API-Key: your-secret-api-key-here" \1. Clone the repository:
+
+
+
+Serve downloaded files securely.  -H "Content-Type: application/json" \```bash
+
+
+
+**Example:**  -d '{git clone <repository-url>
+
+```bash
+
+curl https://your-app.railway.app/files/videos/example-abc123.mp4 -o video.mp4    "url": "https://example.com/video",cd railway-yt-dlp-service
+
+```
+
+    "remote": "s3",```
+
+#### GET /health
+
+    "path": "videos/{safe_title}-{id}.{ext}",
+
+Health check endpoint.
+
+    "format": "bv*+ba/best"2. Install dependencies:
+
+**Response:**
+
+```json  }'```bash
+
+{
+
+  "status": "healthy",pip install -r requirements.txt
+
+  "timestamp": "2024-01-01T12:00:00Z",
+
+  "storage_available": true,# Check job status```
+
+  "active_downloads": 2
+
+}curl http://localhost:8080/downloads/{request_id}
+
+```
+
+```3. Set up environment (optional):
+
+## Configuration
+
+```bash
+
+### Environment Variables
+
+## API Referencecp .env.example .env
+
+| Variable | Required | Default | Description |
+
+|----------|----------|---------|-------------|# Edit .env with your configuration
+
+| `API_KEY` | Yes | - | Secret API key for authentication |
+
+| `STORAGE_DIR` | Yes | `/app/data` | Directory for storing downloaded files |### POST /download```
+
+| `PUBLIC_BASE_URL` | Yes | - | Public URL of your Railway app |
+
+| `MAX_FILE_SIZE` | No | `1GB` | Maximum allowed download size |
+
+| `CLEANUP_INTERVAL` | No | `300` | Cleanup check interval in seconds |
+
+| `FILE_LIFETIME` | No | `3600` | File lifetime in seconds (1 hour) |Create a new download job.4. Run the service:
+
+| `MAX_CONCURRENT_DOWNLOADS` | No | `5` | Maximum concurrent downloads |
+
+```bash
+
+### Storage Configuration
+
+**Headers:**python app.py
+
+For Railway deployment, ensure you have:
+
+- `X-API-Key`: Required API key```
+
+1. **Volume Mount**: Railway volume mounted to `/app/data`
+
+2. **Storage Permissions**: Write access to the mounted volume- `Content-Type: application/json`
+
+3. **Cleanup Process**: The service automatically manages file cleanup
+
+The service will start on `http://localhost:8000`
+
+## Usage Examples
+
+**Request Body:**
+
+### Basic Video Download
+
+```json### Docker Deployment
+
+```bash
+
+curl -X POST https://your-app.railway.app/download \{
+
+  -H "X-API-Key: your-secret-api-key-here" \
+
+  -H "Content-Type: application/json" \  "url": "https://example.com/video",```bash
+
+  -d '{
+
+    "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",  "dest": "BUCKET",docker build -t railway-yt-dlp-service .
+
+    "format": "best",
+
+    "filename_template": "{title}-{id}.{ext}"  "remote": "s3",docker run -p 8000:8000 -e PUBLIC_FILES_DIR=/app/public railway-yt-dlp-service
+
+  }'
+
+```  "path": "videos/{safe_title}-{id}.{ext}",```
+
+
+
+### Audio Only Download  "format": "bv*+ba/best",
+
+
+
+```bash  "webhook": "https://your-app.com/webhook",## API Documentation
+
+curl -X POST https://your-app.railway.app/download \
+
+  -H "X-API-Key: your-secret-api-key-here" \  "headers": {
+
+  -H "Content-Type: application/json" \
+
+  -d '{    "Content-Type": "video/mp4"Once running, visit:
+
+    "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+
+    "format": "bestaudio",  },- **Interactive API Docs**: http://localhost:8000/docs
+
+    "filename_template": "{title}-{id}.{ext}"
+
+  }'  "cookies": "session=abc123",- **ReDoc Documentation**: http://localhost:8000/redoc
+
+```
+
+  "timeout_sec": 1800
+
+### Check Status and Download
+
+}### Core Endpoints
+
+```bash
+
+# Start download```
+
+RESPONSE=$(curl -X POST https://your-app.railway.app/download \
+
+  -H "X-API-Key: your-secret-api-key-here" \#### POST /download
+
+  -H "Content-Type: application/json" \
+
+  -d '{"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"}')**Response:**Submit an intent-based download job with enhanced validation.
+
+
+
+# Extract request ID```json
+
+REQUEST_ID=$(echo $RESPONSE | jq -r '.request_id')
+
 {**Request Body:**
 
-  "status": "QUEUED",```json
+# Check status
+
+curl https://your-app.railway.app/downloads/$REQUEST_ID \  "status": "QUEUED",```json
+
+  -H "X-API-Key: your-secret-api-key-here"
 
   "request_id": "12345678-1234-5678-9abc-123456789abc",{
 
-  "logs_url": "https://api.example.com/downloads/12345678.../logs",  "intent": "download",
+# Download file when ready
+
+curl "https://your-app.railway.app/files/path/to/video.mp4" -o video.mp4  "logs_url": "https://api.example.com/downloads/12345678.../logs",  "intent": "download",
+
+```
 
   "created_at": "2025-09-24T12:00:00Z"  "url": "https://example.com/video",
 
+## Security Features
+
 }  "tag": "my-download-job",
 
-```  "expected_name": "video.mp4",
+- **API Key Authentication**: Secure access control
 
-  "quality": "BEST_MP4",
+- **Path Validation**: Prevents directory traversal attacks```  "expected_name": "video.mp4",
+
+- **File Cleanup**: Automatic deletion prevents storage abuse
+
+- **Request Validation**: Input sanitization and size limits  "quality": "BEST_MP4",
+
+- **CORS Protection**: Configurable cross-origin policies
 
 ### GET /downloads/{request_id}  "dest": "LOCAL",
 
+## Monitoring
+
   "callback_url": "https://your-webhook.com/callback",
+
+The service includes built-in monitoring:
 
 Get download job status.  "separate_audio_video": false,
 
-  "audio_format": "m4a",
+- **Health Checks**: `/health` endpoint for uptime monitoring
 
-**Response:**  "token_count": 1,
+- **Request Logging**: Structured logging for all requests  "audio_format": "m4a",
 
-```json  "custom_ttl": 86400,
+- **Storage Monitoring**: Automatic storage usage tracking
 
-{  "timeout": 5400,
+- **Error Tracking**: Comprehensive error logging**Response:**  "token_count": 1,
 
-  "status": "DONE",  "retries": 3,
 
-  "request_id": "12345678-1234-5678-9abc-123456789abc",  "socket_timeout": 30
+
+## Troubleshooting```json  "custom_ttl": 86400,
+
+
+
+### Common Issues{  "timeout": 5400,
+
+
+
+1. **Download Fails**: Check if the URL is accessible and supported by yt-dlp  "status": "DONE",  "retries": 3,
+
+2. **File Not Found**: Files are automatically deleted after 1 hour
+
+3. **Storage Full**: The service automatically cleans up old files  "request_id": "12345678-1234-5678-9abc-123456789abc",  "socket_timeout": 30
+
+4. **Slow Downloads**: Consider adjusting `MAX_CONCURRENT_DOWNLOADS`
 
   "object_url": "https://s3.amazonaws.com/bucket/videos/video.mp4",}
 
+### Debug Mode
+
   "bytes": 104857600,```
+
+Set `DEBUG=true` for detailed logging:
 
   "duration_sec": 45.2,
 
-  "logs_url": "https://api.example.com/downloads/12345678.../logs",**Intent-Based Parameters:**
+```bash
+
+DEBUG=true python app.py  "logs_url": "https://api.example.com/downloads/12345678.../logs",**Intent-Based Parameters:**
+
+```
 
   "created_at": "2025-09-24T12:00:00Z",- `intent` (optional): Processing intent - "download", "preview", or "archive" (default: "download")
 
+## License
+
   "completed_at": "2025-09-24T12:01:30Z"  - `download`: Standard processing with 24h default TTL
+
+This project is licensed under the MIT License - see the LICENSE file for details.
 
 }  - `preview`: Quick access with 1h max TTL, LOCAL dest only
 
+## Contributing
+
 ```  - `archive`: Long-term storage with 7d default TTL, single token only
 
+1. Fork the repository
 
+2. Create a feature branch
 
-## Path Templates**Enhanced Parameters:**
+3. Make your changes
+
+4. Add tests if applicable## Path Templates**Enhanced Parameters:**
+
+5. Submit a pull request
 
 - `url` (required): Source URL with strict validation (http/https, max 2048 chars)
 
+## Support
+
 Customize object storage paths using these tokens:- `tag` (optional): Alphanumeric identifier with validation (max 100 chars)
+
+For issues and questions:
 
 - `expected_name` (optional): Output filename with sanitization (max 255 chars)
 
-- `{id}`: Video ID- `timeout` (optional): Download timeout, 60-7200 seconds (default: 5400)
+1. Check the [Issues](../../issues) page
 
+2. Review the troubleshooting section- `{id}`: Video ID- `timeout` (optional): Download timeout, 60-7200 seconds (default: 5400)
+
+3. Create a new issue with detailed information
 - `{title}`: Full title- `retries` (optional): Retry attempts per strategy, 1-10 (default: 3)
 
 - `{safe_title}`: Sanitized title (filesystem safe)- `socket_timeout` (optional): Socket timeout, 10-300 seconds (default: 30)
