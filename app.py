@@ -81,10 +81,12 @@ logger = logging.getLogger(__name__)
 # =========================
 # Metrics
 # =========================
-JOBS_TOTAL = prometheus_client.Counter('jobs_total', 'Total jobs processed', ['status'])
-JOBS_DURATION = prometheus_client.Histogram('jobs_duration_seconds', 'Job duration')
-BYTES_UPLOADED = prometheus_client.Counter('bytes_uploaded_total', 'Total bytes uploaded')
-JOBS_IN_FLIGHT = prometheus_client.Gauge('jobs_in_flight', 'Jobs currently running')
+# Create a custom registry to avoid conflicts
+custom_registry = prometheus_client.CollectorRegistry()
+JOBS_TOTAL = prometheus_client.Counter('jobs_total', 'Total jobs processed', ['status'], registry=custom_registry)
+JOBS_DURATION = prometheus_client.Histogram('jobs_duration_seconds', 'Job duration', registry=custom_registry)
+BYTES_UPLOADED = prometheus_client.Counter('bytes_uploaded_total', 'Total bytes uploaded', registry=custom_registry)
+JOBS_IN_FLIGHT = prometheus_client.Gauge('jobs_in_flight', 'Jobs currently running', registry=custom_registry)
 
 # =========================
 # State Management
@@ -655,8 +657,9 @@ async def metrics():
     """Prometheus metrics endpoint."""
     from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
     
+    # Use our custom registry
     return Response(
-        content=generate_latest(),
+        content=generate_latest(custom_registry),
         media_type=CONTENT_TYPE_LATEST
     )
 
