@@ -30,7 +30,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
 
-from process import StreamingPipeline
+from process import RailwayStoragePipeline
 
 # =========================
 # Configuration
@@ -43,7 +43,7 @@ if not API_KEY:
     raise RuntimeError("API_KEY environment variable is required")
 
 ALLOW_YT_DOWNLOADS = os.getenv("ALLOW_YT_DOWNLOADS", "false").lower() == "true"
-RCLONE_REMOTE_DEFAULT = os.getenv("RCLONE_REMOTE_DEFAULT", "")
+STORAGE_DIR = os.getenv("STORAGE_DIR", "/tmp/railway-downloads")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 WORKERS = int(os.getenv("WORKERS", "2"))
 
@@ -103,15 +103,12 @@ limiter = Limiter(
 # =========================
 class DownloadRequest(BaseModel):
     url: str = Field(..., description="Source URL to download")
-    dest: str = Field("BUCKET", description="Destination type")
-    remote: Optional[str] = Field(None, description="rclone remote name")
-    path: str = Field("videos/{safe_title}-{id}.{ext}", description="Object path template")
+    dest: str = Field("RAILWAY", description="Destination type")
+    path: str = Field("videos/{safe_title}-{id}.{ext}", description="File path template")
     format: str = Field("bv*+ba/best", description="yt-dlp format selector")
     webhook: Optional[str] = Field(None, description="Webhook URL for completion notification")
-    headers: Dict[str, str] = Field(default_factory=dict, description="Custom headers for object storage")
     cookies: Optional[str] = Field(None, description="Cookies for yt-dlp")
     timeout_sec: int = Field(DEFAULT_TIMEOUT_SEC, ge=60, le=7200, description="Timeout in seconds")
-    content_type: Optional[str] = Field(None, description="Content-Type header override")
 
     @field_validator('url')
     @classmethod
@@ -144,20 +141,21 @@ class DownloadRequest(BaseModel):
     @field_validator('dest')
     @classmethod
     def validate_dest(cls, v: str) -> str:
-        if v not in ["BUCKET"]:
-            raise ValueError("Only 'BUCKET' destination is supported")
+        if v not in ["RAILWAY"]:
+            raise ValueError("Only 'RAILWAY' destination is supported")
         return v
 
 class DownloadResponse(BaseModel):
     status: str = Field(..., description="Job status: QUEUED, RUNNING, DONE, ERROR")
     request_id: str = Field(..., description="Unique request identifier")
-    object_url: Optional[str] = Field(None, description="URL to access the uploaded object")
-    bytes: Optional[int] = Field(None, description="Bytes uploaded")
+    file_url: Optional[str] = Field(None, description="URL to access the downloaded file")
+    bytes: Optional[int] = Field(None, description="Bytes downloaded")
     duration_sec: Optional[float] = Field(None, description="Processing duration")
     logs_url: Optional[str] = Field(None, description="URL to access job logs")
     error: Optional[str] = Field(None, description="Error message if status is ERROR")
     created_at: Optional[str] = Field(None, description="Job creation timestamp")
     completed_at: Optional[str] = Field(None, description="Job completion timestamp")
+    deletion_time: Optional[str] = Field(None, description="Scheduled deletion time (1 hour after completion)")
 
 class HealthResponse(BaseModel):
     status: str
@@ -326,44 +324,38 @@ async def process_download_job(request_id: str, payload: DownloadRequest):
         add_job_log(request_id, f"Starting download: {payload.url}")
         JOBS_IN_FLIGHT.inc()
         
-        # Determine remote and validate rclone config
-        remote = payload.remote or RCLONE_REMOTE_DEFAULT
-        if not remote:
-            raise ValueError("No rclone remote specified and no default configured")
+        add_job_log(request_id, f"Using Railway storage directory: {STORAGE_DIR}")
         
-        add_job_log(request_id, f"Using rclone remote: {remote}")
-        
-        # Create streaming pipeline
-        pipeline = StreamingPipeline(
+        # Create Railway storage pipeline
+        pipeline = RailwayStoragePipeline(
             request_id=request_id,
             source_url=payload.url,
-            rclone_remote=remote,
+            storage_dir=STORAGE_DIR,
             path_template=payload.path,
             yt_dlp_format=payload.format,
             timeout_sec=payload.timeout_sec,
             progress_timeout_sec=PROGRESS_TIMEOUT_SEC,
             max_content_length=MAX_CONTENT_LENGTH,
-            headers=payload.headers,
             cookies=payload.cookies,
-            content_type=payload.content_type,
             log_callback=lambda msg, level="INFO": add_job_log(request_id, msg, level)
         )
         
         # Execute pipeline
         result = await pipeline.execute()
         
-        # Generate object URL
-        object_url = None
-        if result.get('object_path'):
-            object_url = await get_object_url(remote, result['object_path'])
+        # Generate file URL
+        file_url = None
+        if result.get('file_path'):
+            file_url = f"{PUBLIC_BASE_URL}/files/{result['file_path']}" if PUBLIC_BASE_URL else f"/files/{result['file_path']}"
         
         # Update job with success
         update_job(
             request_id,
             status='DONE',
             bytes=result.get('bytes_transferred', 0),
-            object_path=result.get('object_path'),
-            object_url=object_url
+            file_path=result.get('file_path'),
+            file_url=file_url,
+            deletion_time=result.get('deletion_time')
         )
         
         add_job_log(request_id, f"Download completed successfully. Bytes: {result.get('bytes_transferred', 0)}")
@@ -389,30 +381,7 @@ async def process_download_job(request_id: str, payload: DownloadRequest):
     finally:
         JOBS_IN_FLIGHT.dec()
 
-async def get_object_url(remote: str, object_path: str) -> Optional[str]:
-    """Get public or signed URL for object using rclone link."""
-    try:
-        cmd = ['rclone', 'link', f"{remote}:{object_path}"]
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
-        
-        if process.returncode == 0:
-            url = stdout.decode().strip()
-            if url:
-                return url
-        
-        # Fallback to canonical path if rclone link not supported
-        logger.warning(f"rclone link failed for {remote}:{object_path}, using canonical path")
-        return f"{remote}:{object_path}"
-        
-    except Exception as e:
-        logger.error(f"Failed to get object URL: {e}")
-        return f"{remote}:{object_path}"
+
 
 async def send_webhook(webhook_url: str, request_id: str, status: str, error: Optional[str] = None):
     """Send webhook notification."""
@@ -426,9 +395,10 @@ async def send_webhook(webhook_url: str, request_id: str, status: str, error: Op
             'status': status,
             'created_at': job.get('created_at'),
             'completed_at': job.get('completed_at'),
-            'object_url': job.get('object_url'),
+            'file_url': job.get('file_url'),
             'bytes': job.get('bytes', 0),
-            'duration_sec': job.get('duration_sec')
+            'duration_sec': job.get('duration_sec'),
+            'deletion_time': job.get('deletion_time')
         }
         
         if error:
@@ -460,15 +430,19 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down download service...")
     shutdown_event.set()
     
+    # Shutdown the file deletion scheduler
+    from process import shutdown_deletion_scheduler
+    shutdown_deletion_scheduler()
+    
     if executor:
         executor.shutdown(wait=True)
     
     logger.info("Download service shutdown complete")
 
 app = FastAPI(
-    title="yt-dlp Streaming Service",
-    description="Production-ready yt-dlp service with rclone streaming to object storage",
-    version="2.0.0",
+    title="yt-dlp Railway Storage Service", 
+    description="Production-ready yt-dlp service with Railway storage and auto-deletion",
+    version="2.1.0",
     lifespan=lifespan
 )
 
@@ -494,12 +468,13 @@ app.add_middleware(SlowAPIMiddleware)
 async def root():
     """Root endpoint with service information."""
     return {
-        "service": "yt-dlp Streaming Service",
-        "version": "2.0.0",
+        "service": "yt-dlp Railway Storage Service",
+        "version": "2.1.0",
         "status": "healthy",
         "features": {
             "youtube_downloads": ALLOW_YT_DOWNLOADS,
-            "default_remote": RCLONE_REMOTE_DEFAULT or "(not configured)",
+            "storage_dir": STORAGE_DIR,
+            "auto_delete": "1 hour",
             "workers": WORKERS,
             "rate_limit_rps": RATE_LIMIT_RPS
         },
@@ -560,13 +535,14 @@ async def get_download_status(request_id: str):
     return DownloadResponse(
         status=job['status'],
         request_id=request_id,
-        object_url=job.get('object_url'),
+        file_url=job.get('file_url'),
         bytes=job.get('bytes'),
         duration_sec=job.get('duration_sec'),
         logs_url=logs_url,
         error=job.get('error'),
         created_at=job.get('created_at'),
-        completed_at=job.get('completed_at')
+        completed_at=job.get('completed_at'),
+        deletion_time=job.get('deletion_time')
     )
 
 @app.get("/downloads/{request_id}/logs")
@@ -605,21 +581,20 @@ async def healthcheck():
     
     checks = {
         "executor": "healthy" if executor and not executor._shutdown else "unhealthy",
-        "rclone": "unknown",
+        "storage": "unknown",
         "yt_dlp": "unknown"
     }
     
-    # Check rclone availability
+    # Check storage directory availability
     try:
-        process = await asyncio.create_subprocess_exec(
-            'rclone', 'version',
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL
-        )
-        await asyncio.wait_for(process.communicate(), timeout=5)
-        checks["rclone"] = "healthy" if process.returncode == 0 else "unhealthy"
+        storage_path = Path(STORAGE_DIR)
+        if storage_path.exists() and storage_path.is_dir():
+            checks["storage"] = "healthy"
+        else:
+            storage_path.mkdir(parents=True, exist_ok=True)
+            checks["storage"] = "healthy" if storage_path.exists() else "unhealthy"
     except Exception:
-        checks["rclone"] = "unhealthy"
+        checks["storage"] = "unhealthy"
     
     # Check yt-dlp availability
     try:
@@ -642,7 +617,7 @@ async def healthcheck():
     
     response = HealthResponse(
         status=overall_status,
-        version="2.0.0",
+        version="2.1.0",
         timestamp=datetime.now(timezone.utc).isoformat(),
         checks=checks
     )
@@ -665,9 +640,9 @@ async def readiness():
 async def version():
     """Version endpoint."""
     return {
-        "version": "2.0.0",
+        "version": "2.1.0", 
         "build_date": "2025-09-24",
-        "features": ["streaming", "rclone", "yt-dlp"]
+        "features": ["railway-storage", "auto-deletion", "yt-dlp"]
     }
 
 @app.get("/metrics")
@@ -678,6 +653,40 @@ async def metrics():
     return Response(
         content=generate_latest(),
         media_type=CONTENT_TYPE_LATEST
+    )
+
+@app.get("/files/{file_path:path}")
+async def serve_file(file_path: str):
+    """Serve downloaded files with auto-cleanup check."""
+    from fastapi.responses import FileResponse
+    
+    # Security: prevent directory traversal
+    if ".." in file_path or file_path.startswith("/"):
+        raise HTTPException(status_code=400, detail="Invalid file path")
+    
+    full_path = Path(STORAGE_DIR) / file_path
+    
+    # Check if file exists
+    if not full_path.exists() or not full_path.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    # Security: ensure file is within storage directory
+    try:
+        full_path.resolve().relative_to(Path(STORAGE_DIR).resolve())
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Access denied")
+    
+    # Determine content type based on file extension
+    content_type = "application/octet-stream"
+    if full_path.suffix.lower() in ['.mp4', '.mkv', '.avi', '.mov']:
+        content_type = "video/mp4"
+    elif full_path.suffix.lower() in ['.mp3', '.wav', '.flac', '.m4a']:
+        content_type = "audio/mpeg"
+    
+    return FileResponse(
+        path=str(full_path),
+        media_type=content_type,
+        filename=full_path.name
     )
 
 # =========================

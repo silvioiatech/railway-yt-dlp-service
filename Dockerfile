@@ -11,20 +11,13 @@ RUN apt-get update && apt-get install -y \
 # Install yt-dlp
 RUN pip install --no-cache-dir yt-dlp
 
-# Install rclone
-RUN curl -O https://downloads.rclone.org/rclone-current-linux-amd64.zip \
-    && unzip rclone-current-linux-amd64.zip \
-    && cp rclone-*-linux-amd64/rclone /usr/bin/ \
-    && chown root:root /usr/bin/rclone \
-    && chmod 755 /usr/bin/rclone \
-    && rm -rf rclone-*
-
 # Create non-root user
 RUN useradd --create-home --shell /bin/bash --user-group --uid 1000 appuser
 
 # Create directories
 RUN mkdir -p /var/log/app && chown -R appuser:appuser /var/log/app
 RUN mkdir -p /app && chown -R appuser:appuser /app
+RUN mkdir -p /tmp/railway-downloads && chown -R appuser:appuser /tmp/railway-downloads
 
 # Set work directory
 WORKDIR /app
