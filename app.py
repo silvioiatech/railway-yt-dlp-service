@@ -39,8 +39,9 @@ from process import RailwayStoragePipeline
 
 # Core settings
 API_KEY = os.getenv("API_KEY", "")
-if not API_KEY:
-    raise RuntimeError("API_KEY environment variable is required")
+REQUIRE_API_KEY = os.getenv("REQUIRE_API_KEY", "true").lower() == "true"
+if REQUIRE_API_KEY and not API_KEY:
+    raise RuntimeError("API_KEY environment variable is required when REQUIRE_API_KEY is true")
 
 ALLOW_YT_DOWNLOADS = os.getenv("ALLOW_YT_DOWNLOADS", "false").lower() == "true"
 STORAGE_DIR = os.getenv("STORAGE_DIR", "/tmp/railway-downloads")
@@ -169,6 +170,10 @@ class HealthResponse(BaseModel):
 def require_api_key(func):
     @wraps(func)
     async def wrapper(*args, **kwargs):
+        # Skip authentication if REQUIRE_API_KEY is false
+        if not REQUIRE_API_KEY:
+            return await func(*args, **kwargs)
+            
         request = kwargs.get('request') or (args[0] if args else None)
         if not request:
             raise HTTPException(status_code=500, detail="Internal error: no request object")

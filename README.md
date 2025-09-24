@@ -62,11 +62,25 @@ The service will start on `http://localhost:8080`
 
 ### Authentication
 
-All API endpoints require authentication via the `X-API-Key` header:
+The service can be configured to run with or without API key authentication:
+
+#### With API Key (Secure Mode)
+
+When `REQUIRE_API_KEY=true`, all endpoints require authentication:
 
 ```bash
 curl -H "X-API-Key: your-secret-api-key-here" ...
 ```
+
+#### Without API Key (Open Access Mode)
+
+When `REQUIRE_API_KEY=false`, no authentication is required:
+
+```bash
+curl https://your-app.railway.app/download ...
+```
+
+> **Note**: Open access mode is convenient but less secure. Consider using rate limiting and other security features when running in this mode.
 
 ### Endpoints
 
@@ -227,7 +241,8 @@ Customize object storage paths using these tokens:
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `API_KEY` | Yes | - | Secret API key for authentication |
+| `REQUIRE_API_KEY` | No | `true` | Enable/disable API key authentication |
+| `API_KEY` | Yes (if REQUIRE_API_KEY=true) | - | Secret API key for authentication |
 | `ALLOW_YT_DOWNLOADS` | No | `false` | Enable/disable YouTube downloads (ToS compliance) |
 | `STORAGE_DIR` | Yes | `/app/data` | Directory for storing downloaded files |
 | `PUBLIC_BASE_URL` | Yes | - | Public URL of your Railway app |
