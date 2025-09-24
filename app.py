@@ -294,6 +294,11 @@ def update_job(request_id: str, **updates) -> Dict[str, Any]:
         created_at = datetime.fromisoformat(job['created_at'].replace('Z', '+00:00'))
         job['duration_sec'] = (now - created_at).total_seconds()
     
+    # Convert timestamp to ISO format for deletion_time if it's a float
+    if 'deletion_time' in job and isinstance(job['deletion_time'], float):
+        deletion_dt = datetime.fromtimestamp(job['deletion_time'], tz=timezone.utc)
+        job['deletion_time'] = deletion_dt.isoformat()
+    
     return job
 
 def get_job(request_id: str) -> Optional[Dict[str, Any]]:
