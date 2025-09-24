@@ -1,288 +1,572 @@
-# Railway yt-dlp Service
+# yt-dlp Streaming Service# Railway yt-dlp Service
 
-A comprehensive FastAPI-based service for downloading media from various platforms using yt-dlp, with intent-based processing, enhanced security, Google Drive integration, and comprehensive observability.
 
-## Features
 
-### Core Functionality
-- **Intent-Based Downloads**: Smart processing with download, preview, and archive intents
-- **Media Download**: Download videos/audio from 1000+ platforms using yt-dlp
-- **Enhanced Validation**: Strict URL validation, parameter constraints, and error handling
-- **Multiple Quality Options**: Best original, MP4 optimized, or strict MP4 re-encoding
-- **Dual Storage**: Local storage with multi-token one-time URLs or Google Drive integration
+A production-ready service that downloads videos using yt-dlp and streams them directly to object storage using rclone, with no temporary files.A comprehensive FastAPI-based service for downloading media from various platforms using yt-dlp, with intent-based processing, enhanced security, Google Drive integration, and comprehensive observability.
+
+
+
+## Features## Features
+
+
+
+- 🚀 **Zero-disk streaming**: Direct pipe from yt-dlp to rclone### Core Functionality
+
+- 🗄️ **Multi-cloud support**: S3, GCS, Azure, Backblaze, and more via rclone- **Intent-Based Downloads**: Smart processing with download, preview, and archive intents
+
+- 📊 **Observability**: Prometheus metrics, structured logging, health checks- **Media Download**: Download videos/audio from 1000+ platforms using yt-dlp
+
+- 🔒 **Security**: API key authentication, rate limiting, domain allowlists- **Enhanced Validation**: Strict URL validation, parameter constraints, and error handling
+
+- ⚡ **Performance**: Concurrent workers, configurable timeouts- **Multiple Quality Options**: Best original, MP4 optimized, or strict MP4 re-encoding
+
+- 🔄 **Robust**: Graceful shutdown, process cleanup, error handling- **Dual Storage**: Local storage with multi-token one-time URLs or Google Drive integration
+
 - **Background Processing**: Asynchronous download jobs with comprehensive status tracking
-- **Range Support**: HTTP range requests for efficient media streaming
-- **Multi-Token URLs**: Generate multiple one-time download tokens for the same file
-- **Smart TTL**: Intent-aware token expiration with configurable cleanup policies
-- **Audio+Video Artifacts**: Option to download separate audio and video files
-- **Metadata Discovery**: Enhanced /discover endpoint with stricter validation and complexity limits
 
-### Security & Rate Limiting
-- **API Key Authentication**: Optional API key protection for enhanced security
-- **Signed Download Links**: HMAC-SHA256 signed URLs with expiry validation for secure downloads
+## Quick Start- **Range Support**: HTTP range requests for efficient media streaming
+
+- **Multi-Token URLs**: Generate multiple one-time download tokens for the same file
+
+### 1. Configure rclone- **Smart TTL**: Intent-aware token expiration with configurable cleanup policies
+
+- **Audio+Video Artifacts**: Option to download separate audio and video files
+
+First, set up your object storage backend:- **Metadata Discovery**: Enhanced /discover endpoint with stricter validation and complexity limits
+
+
+
+```bash### Security & Rate Limiting
+
+# Configure a remote (example: S3)- **API Key Authentication**: Optional API key protection for enhanced security
+
+rclone config- **Signed Download Links**: HMAC-SHA256 signed URLs with expiry validation for secure downloads
+
 - **Enhanced Rate Limiting**: Complexity-based rate limiting with configurable thresholds
-- **Security Headers**: CORS, XSS protection, content type validation
-- **Input Validation**: Comprehensive request validation with Pydantic models
-- **Configuration Validation**: Startup validation for environment configuration
+
+# Test your configuration- **Security Headers**: CORS, XSS protection, content type validation
+
+rclone ls myremote:- **Input Validation**: Comprehensive request validation with Pydantic models
+
+```- **Configuration Validation**: Startup validation for environment configuration
+
 - **Intent-Based Security**: Different security policies based on download intent
 
-### Observability & Monitoring
-- **Structured Logging**: JSON-formatted logs with loguru
-- **Prometheus Metrics**: Built-in metrics endpoint for monitoring
-- **Health Checks**: Enhanced health check with dependency validation
-- **Request Tracing**: Automatic request/response logging with timing
+### 2. Set environment variables
 
-### Configuration
+### Observability & Monitoring
+
+```bash- **Structured Logging**: JSON-formatted logs with loguru
+
+cp .env.example .env- **Prometheus Metrics**: Built-in metrics endpoint for monitoring
+
+# Edit .env with your settings- **Health Checks**: Enhanced health check with dependency validation
+
+```- **Request Tracing**: Automatic request/response logging with timing
+
+
+
+### 3. Run with Docker Compose### Configuration
+
 - **Environment Variables**: Full configuration via environment variables
-- **Development Mode**: Easy setup for local development
-- **Production Ready**: Optimized for production deployment
+
+```bash- **Development Mode**: Easy setup for local development
+
+make dev- **Production Ready**: Optimized for production deployment
+
+```
 
 ## Quick Start
 
+### 4. Test the service
+
 ### Prerequisites
-- Python 3.12+
-- ffmpeg (for video processing)
-- yt-dlp (installed via requirements.txt)
 
-### Installation
+```bash- Python 3.12+
 
-1. Clone the repository:
-```bash
-git clone <repository-url>
-cd railway-yt-dlp-service
-```
+# Health check- ffmpeg (for video processing)
 
-2. Install dependencies:
-```bash
+curl http://localhost:8080/healthz- yt-dlp (installed via requirements.txt)
+
+
+
+# Create a download job### Installation
+
+curl -X POST http://localhost:8080/download \
+
+  -H "X-API-Key: your-secret-api-key-here" \1. Clone the repository:
+
+  -H "Content-Type: application/json" \```bash
+
+  -d '{git clone <repository-url>
+
+    "url": "https://example.com/video",cd railway-yt-dlp-service
+
+    "remote": "s3",```
+
+    "path": "videos/{safe_title}-{id}.{ext}",
+
+    "format": "bv*+ba/best"2. Install dependencies:
+
+  }'```bash
+
 pip install -r requirements.txt
-```
 
-3. Set up environment (optional):
+# Check job status```
+
+curl http://localhost:8080/downloads/{request_id}
+
+```3. Set up environment (optional):
+
 ```bash
-cp .env.example .env
+
+## API Referencecp .env.example .env
+
 # Edit .env with your configuration
-```
 
-4. Run the service:
+### POST /download```
+
+
+
+Create a new download job.4. Run the service:
+
 ```bash
-python app.py
-```
+
+**Headers:**python app.py
+
+- `X-API-Key`: Required API key```
+
+- `Content-Type: application/json`
 
 The service will start on `http://localhost:8000`
 
-### Docker Deployment
+**Request Body:**
 
-```bash
-docker build -t railway-yt-dlp-service .
-docker run -p 8000:8000 -e PUBLIC_FILES_DIR=/app/public railway-yt-dlp-service
+```json### Docker Deployment
+
+{
+
+  "url": "https://example.com/video",```bash
+
+  "dest": "BUCKET",docker build -t railway-yt-dlp-service .
+
+  "remote": "s3",docker run -p 8000:8000 -e PUBLIC_FILES_DIR=/app/public railway-yt-dlp-service
+
+  "path": "videos/{safe_title}-{id}.{ext}",```
+
+  "format": "bv*+ba/best",
+
+  "webhook": "https://your-app.com/webhook",## API Documentation
+
+  "headers": {
+
+    "Content-Type": "video/mp4"Once running, visit:
+
+  },- **Interactive API Docs**: http://localhost:8000/docs
+
+  "cookies": "session=abc123",- **ReDoc Documentation**: http://localhost:8000/redoc
+
+  "timeout_sec": 1800
+
+}### Core Endpoints
+
 ```
-
-## API Documentation
-
-Once running, visit:
-- **Interactive API Docs**: http://localhost:8000/docs
-- **ReDoc Documentation**: http://localhost:8000/redoc
-
-### Core Endpoints
 
 #### POST /download
-Submit an intent-based download job with enhanced validation.
 
-**Request Body:**
+**Response:**Submit an intent-based download job with enhanced validation.
+
 ```json
-{
-  "intent": "download",
-  "url": "https://example.com/video",
-  "tag": "my-download-job",
-  "expected_name": "video.mp4",
+
+{**Request Body:**
+
+  "status": "QUEUED",```json
+
+  "request_id": "12345678-1234-5678-9abc-123456789abc",{
+
+  "logs_url": "https://api.example.com/downloads/12345678.../logs",  "intent": "download",
+
+  "created_at": "2025-09-24T12:00:00Z"  "url": "https://example.com/video",
+
+}  "tag": "my-download-job",
+
+```  "expected_name": "video.mp4",
+
   "quality": "BEST_MP4",
-  "dest": "LOCAL",
+
+### GET /downloads/{request_id}  "dest": "LOCAL",
+
   "callback_url": "https://your-webhook.com/callback",
-  "separate_audio_video": false,
+
+Get download job status.  "separate_audio_video": false,
+
   "audio_format": "m4a",
-  "token_count": 1,
-  "custom_ttl": 86400,
-  "timeout": 5400,
-  "retries": 3,
-  "socket_timeout": 30
-}
-```
 
-**Intent-Based Parameters:**
-- `intent` (optional): Processing intent - "download", "preview", or "archive" (default: "download")
-  - `download`: Standard processing with 24h default TTL
-  - `preview`: Quick access with 1h max TTL, LOCAL dest only
-  - `archive`: Long-term storage with 7d default TTL, single token only
+**Response:**  "token_count": 1,
 
-**Enhanced Parameters:**
+```json  "custom_ttl": 86400,
+
+{  "timeout": 5400,
+
+  "status": "DONE",  "retries": 3,
+
+  "request_id": "12345678-1234-5678-9abc-123456789abc",  "socket_timeout": 30
+
+  "object_url": "https://s3.amazonaws.com/bucket/videos/video.mp4",}
+
+  "bytes": 104857600,```
+
+  "duration_sec": 45.2,
+
+  "logs_url": "https://api.example.com/downloads/12345678.../logs",**Intent-Based Parameters:**
+
+  "created_at": "2025-09-24T12:00:00Z",- `intent` (optional): Processing intent - "download", "preview", or "archive" (default: "download")
+
+  "completed_at": "2025-09-24T12:01:30Z"  - `download`: Standard processing with 24h default TTL
+
+}  - `preview`: Quick access with 1h max TTL, LOCAL dest only
+
+```  - `archive`: Long-term storage with 7d default TTL, single token only
+
+
+
+## Path Templates**Enhanced Parameters:**
+
 - `url` (required): Source URL with strict validation (http/https, max 2048 chars)
-- `tag` (optional): Alphanumeric identifier with validation (max 100 chars)
+
+Customize object storage paths using these tokens:- `tag` (optional): Alphanumeric identifier with validation (max 100 chars)
+
 - `expected_name` (optional): Output filename with sanitization (max 255 chars)
-- `timeout` (optional): Download timeout, 60-7200 seconds (default: 5400)
-- `retries` (optional): Retry attempts per strategy, 1-10 (default: 3)
-- `socket_timeout` (optional): Socket timeout, 10-300 seconds (default: 30)
 
-**Multi-Artifact Parameters:**
-- `separate_audio_video` (optional): Download separate audio and video files (default: false)
-- `audio_format` (optional): Audio format when separating: m4a, mp3, or best (default: m4a)
+- `{id}`: Video ID- `timeout` (optional): Download timeout, 60-7200 seconds (default: 5400)
+
+- `{title}`: Full title- `retries` (optional): Retry attempts per strategy, 1-10 (default: 3)
+
+- `{safe_title}`: Sanitized title (filesystem safe)- `socket_timeout` (optional): Socket timeout, 10-300 seconds (default: 30)
+
+- `{ext}`: File extension (e.g., mp4)
+
+- `{uploader}`: Uploader name**Multi-Artifact Parameters:**
+
+- `{date}`: Upload date (YYYY-MM-DD)- `separate_audio_video` (optional): Download separate audio and video files (default: false)
+
+- `{random}`: Random hex string- `audio_format` (optional): Audio format when separating: m4a, mp3, or best (default: m4a)
+
 - `token_count` (optional): Number of tokens to create per artifact, 1-5 (default: 1)
-- `custom_ttl` (optional): Custom TTL for tokens in seconds, 60s to 7 days (default: intent-based)
 
-**Response:**
+**Examples:**- `custom_ttl` (optional): Custom TTL for tokens in seconds, 60s to 7 days (default: intent-based)
+
+- `videos/{safe_title}-{id}.{ext}` → `videos/My_Video-abc123.mp4`
+
+- `{date}/{uploader}/{id}.{ext}` → `2025-09-24/Creator/abc123.mp4`**Response:**
+
 ```json
-{
-  "accepted": true,
-  "tag": "my-download-job",
-  "expected_name": "video.mp4",
-  "note": "processing with intent: download"
-}
-```
 
-#### GET /status?tag={job_tag}
-Check download job status.
+## rclone Remote Examples{
+
+  "accepted": true,
+
+### Amazon S3  "tag": "my-download-job",
+
+```  "expected_name": "video.mp4",
+
+[s3]  "note": "processing with intent: download"
+
+type = s3}
+
+provider = AWS```
+
+access_key_id = YOUR_ACCESS_KEY
+
+secret_access_key = YOUR_SECRET_KEY#### GET /status?tag={job_tag}
+
+region = us-east-1Check download job status.
+
+```
 
 #### GET /result?tag={job_tag}
-Get download job result with enhanced metadata and tag management.
 
-**Query Parameters:**
-- `tag` (required): Job tag identifier (validated, alphanumeric only)
-- `include_metadata` (optional): Include detailed metadata (default: false)
-- `format` (optional): Response format - "json" or "minimal" (default: "json")
+### Google Cloud StorageGet download job result with enhanced metadata and tag management.
+
+```
+
+[gcs]**Query Parameters:**
+
+type = google cloud storage- `tag` (required): Job tag identifier (validated, alphanumeric only)
+
+project_number = 123456789- `include_metadata` (optional): Include detailed metadata (default: false)
+
+service_account_file = /path/to/service-account.json- `format` (optional): Response format - "json" or "minimal" (default: "json")
+
+```
 
 **Enhanced Response (with include_metadata=true):**
-```json
-{
-  "tag": "my-download-job",
-  "status": "ready",
-  "expected_name": "video.mp4",
-  "once_url": "/once/abc123?sig=f3d1a2c4&exp=1640995200",
-  "once_urls": ["/once/abc123?sig=f3d1a2c4&exp=1640995200"],
+
+### Azure Blob Storage```json
+
+```{
+
+[azure]  "tag": "my-download-job",
+
+type = azureblob  "status": "ready",
+
+account = mystorageaccount  "expected_name": "video.mp4",
+
+key = YOUR_STORAGE_KEY  "once_url": "/once/abc123?sig=f3d1a2c4&exp=1640995200",
+
+```  "once_urls": ["/once/abc123?sig=f3d1a2c4&exp=1640995200"],
+
   "expires_in_sec": 86400,
-  "quality": "BEST_MP4",
-  "dest": "LOCAL",
-  "intent": "download",
-  "created_at": 1640908800.0,
-  "updated_at": 1640912400.0,
-  "processing_duration": 3600.0
-}
+
+### Backblaze B2  "quality": "BEST_MP4",
+
+```  "dest": "LOCAL",
+
+[b2]  "intent": "download",
+
+type = b2  "created_at": 1640908800.0,
+
+account = YOUR_ACCOUNT_ID  "updated_at": 1640912400.0,
+
+key = YOUR_APPLICATION_KEY  "processing_duration": 3600.0
+
+```}
+
 ```
 
-**Minimal Response (format=minimal):**
-```json
-{
-  "tag": "my-download-job",
-  "status": "ready",
-  "once_url": "/once/abc123?sig=f3d1a2c4&exp=1640995200",
-  "expires_in_sec": 86400
-}
+### MinIO (Self-hosted)
+
+```**Minimal Response (format=minimal):**
+
+[minio]```json
+
+type = s3{
+
+provider = Minio  "tag": "my-download-job",
+
+access_key_id = minioadmin  "status": "ready",
+
+secret_access_key = minioadmin  "once_url": "/once/abc123?sig=f3d1a2c4&exp=1640995200",
+
+endpoint = http://localhost:9000  "expires_in_sec": 86400
+
+```}
+
 ```
+
+## Configuration
 
 **Multi-Artifact Response (when separate_audio_video=true):**
-```json
-{
-  "tag": "my-download-job", 
-  "status": "ready",
-  "expected_name": "video.mp4",
-  "artifacts": [
-    {
-      "type": "audio",
-      "filename": "video_audio.m4a",
-      "urls": ["/once/audio1?sig=abc123&exp=1640995200"],
-      "format": "m4a"
-    },
-    {
-      "type": "video", 
-      "filename": "video_video.mp4",
-      "urls": ["/once/video1?sig=def456&exp=1640995200"],
-      "format": "mp4"
-    }
-  ],
-  "expires_in_sec": 86400,
-  "quality": "BEST_MP4",
-  "dest": "LOCAL",
-  "separate_audio_video": true
-}
-```
 
-#### GET /once/{token}
+### Required Environment Variables```json
+
+{
+
+- `API_KEY`: Secret key for API authentication  "tag": "my-download-job", 
+
+- `ALLOW_YT_DOWNLOADS`: Enable/disable YouTube downloads (ToS compliance)  "status": "ready",
+
+- `RCLONE_REMOTE_DEFAULT`: Default rclone remote name  "expected_name": "video.mp4",
+
+  "artifacts": [
+
+### Optional Environment Variables    {
+
+      "type": "audio",
+
+- `PUBLIC_BASE_URL`: Base URL for generating log links      "filename": "video_audio.m4a",
+
+- `WORKERS`: Number of concurrent download workers (default: 2)      "urls": ["/once/audio1?sig=abc123&exp=1640995200"],
+
+- `RATE_LIMIT_RPS`: Rate limit requests per second (default: 2)      "format": "m4a"
+
+- `DEFAULT_TIMEOUT_SEC`: Default job timeout (default: 1800)    },
+
+- `MAX_CONTENT_LENGTH`: Maximum file size (default: 10GB)    {
+
+- `ALLOWED_DOMAINS`: Comma-separated allowlist of domains      "type": "video", 
+
+- `LOG_LEVEL`: Logging level (default: INFO)      "filename": "video_video.mp4",
+
+      "urls": ["/once/video1?sig=def456&exp=1640995200"],
+
+## Observability      "format": "mp4"
+
+    }
+
+### Health Checks  ],
+
+  "expires_in_sec": 86400,
+
+- `GET /healthz`: Comprehensive health check  "quality": "BEST_MP4",
+
+- `GET /readyz`: Readiness probe  "dest": "LOCAL",
+
+- `GET /version`: Version information  "separate_audio_video": true
+
+}
+
+### Metrics```
+
+
+
+Prometheus metrics available at `/metrics`:#### GET /once/{token}
+
 Stream downloaded file (single-use, supports HTTP ranges).
 
-#### POST /mint
-Mint additional one-time tokens for an existing file.
+- `jobs_total`: Total jobs processed (by status)
+
+- `jobs_duration_seconds`: Job processing duration histogram#### POST /mint
+
+- `bytes_uploaded_total`: Total bytes uploadedMint additional one-time tokens for an existing file.
+
+- `jobs_in_flight`: Currently running jobs
 
 **Request Body:**
-```json
+
+### Logging```json
+
 {
-  "file_id": "file_abc12345",
-  "count": 3,
-  "ttl_sec": 7200,
+
+- Structured JSON logging to stdout and files  "file_id": "file_abc12345",
+
+- Per-job log files in `/var/log/app/`  "count": 3,
+
+- Request correlation with request IDs  "ttl_sec": 7200,
+
   "tag": "additional_tokens"
-}
+
+## Development}
+
 ```
 
-**Response:**
-```json
+```bash
+
+# Setup development environment**Response:**
+
+make setup```json
+
 {
-  "success": true,
-  "file_id": "file_abc12345",
+
+# Run tests  "success": true,
+
+make test  "file_id": "file_abc12345",
+
   "tokens_created": 3,
-  "urls": [
-    "/once/token1",
+
+# Run with coverage  "urls": [
+
+make test-coverage    "/once/token1",
+
     "/once/token2", 
-    "/once/token3"
-  ],
-  "expires_in_sec": 7200
+
+# Lint and format    "/once/token3"
+
+make lint  ],
+
+make format  "expires_in_sec": 7200
+
 }
-```
+
+# Build Docker image```
+
+make build
 
 **Rate Limit:** 30 requests per minute  
-**Authentication:** API key required (if configured)
 
-#### GET /files
+# Clean up**Authentication:** API key required (if configured)
+
+make clean
+
+```#### GET /files
+
 List available files that can have additional tokens minted.
 
-**Response:**
-```json
-{
-  "files": [
-    {
-      "file_id": "file_abc12345",
-      "filename": "video.mp4",
-      "size": 15728640,
-      "active_tokens": 2,
-      "created_at": "2024-01-15T10:30:00"
-    }
-  ],
-  "total_files": 1
-}
-```
+## Production Deployment
 
-**Rate Limit:** 30 requests per minute  
+**Response:**
+
+### Docker```json
+
+{
+
+```bash  "files": [
+
+docker build -t yt-dlp-streaming-service .    {
+
+docker run -d \      "file_id": "file_abc12345",
+
+  -p 8080:8080 \      "filename": "video.mp4",
+
+  -v ~/.config/rclone:/home/appuser/.config/rclone:ro \      "size": 15728640,
+
+  -v ./logs:/var/log/app \      "active_tokens": 2,
+
+  --env-file .env \      "created_at": "2024-01-15T10:30:00"
+
+  --name yt-dlp-service \    }
+
+  yt-dlp-streaming-service  ],
+
+```  "total_files": 1
+
+}
+
+### Kubernetes```
+
+
+
+See `k8s/` directory for Kubernetes manifests.**Rate Limit:** 30 requests per minute  
+
 **Authentication:** API key required (if configured)
 
+### Security Considerations
+
 #### GET /discover
-Enhanced metadata discovery with strict validation and complexity limits.
 
-Performs metadata discovery across one or more provided source URLs (channels, playlists, individual videos) using yt-dlp without downloading content. Now includes enhanced validation and complexity-based rate limiting.
+1. **API Key**: Use a strong, randomly generated API keyEnhanced metadata discovery with strict validation and complexity limits.
 
-**Query Parameters:**
+2. **Domain Allowlist**: Restrict allowed source domains
+
+3. **Rate Limiting**: Configure appropriate rate limitsPerforms metadata discovery across one or more provided source URLs (channels, playlists, individual videos) using yt-dlp without downloading content. Now includes enhanced validation and complexity-based rate limiting.
+
+4. **Network**: Run in a private network when possible
+
+5. **Updates**: Keep yt-dlp and rclone updated regularly**Query Parameters:**
+
 - `sources` (required): Comma-separated URLs to discover (max 10 sources, max 4096 chars total)
-- `format` (required): Output format - csv, json, or ndjson (strict validation)
+
+## Troubleshooting- `format` (required): Output format - csv, json, or ndjson (strict validation)
+
 - `limit` (optional): Limit per source, 1-1000 (default: 100)
-- `min_views` (optional): Minimum view count filter (0 to 1B)
+
+### Common Issues- `min_views` (optional): Minimum view count filter (0 to 1B)
+
 - `min_duration` (optional): Minimum duration in seconds (1-86400)
-- `max_duration` (optional): Maximum duration in seconds (1-86400, must be > min_duration)
-- `dateafter` (optional): Date filter - YYYYMMDD or now-<days>days format (max 32 chars)
-- `match_filter` (optional): Raw yt-dlp match filter expression (max 512 chars)
-- `fields` (optional): CSV field list (max 512 chars, default: id,title,url,duration,view_count,like_count,uploader,upload_date)
 
-**Enhanced Validation:**
+1. **rclone not found**: Ensure rclone is installed and in PATH- `max_duration` (optional): Maximum duration in seconds (1-86400, must be > min_duration)
+
+2. **Permission denied**: Check file permissions and user configuration- `dateafter` (optional): Date filter - YYYYMMDD or now-<days>days format (max 32 chars)
+
+3. **Network timeouts**: Adjust timeout settings for your network- `match_filter` (optional): Raw yt-dlp match filter expression (max 512 chars)
+
+4. **Storage errors**: Verify rclone remote configuration- `fields` (optional): CSV field list (max 512 chars, default: id,title,url,duration,view_count,like_count,uploader,upload_date)
+
+
+
+### Debug Mode**Enhanced Validation:**
+
 - URLs must be http/https and max 2048 characters each
-- Complexity scoring prevents resource exhaustion (max score: 50)
-- Duration parameters validated for logical consistency
-- Format strictly validated against allowed values
 
-**Rate Limit:** 20 requests per minute + complexity-based throttling  
+Set `LOG_LEVEL=DEBUG` for verbose logging.- Complexity scoring prevents resource exhaustion (max score: 50)
+
+- Duration parameters validated for logical consistency
+
+## License- Format strictly validated against allowed values
+
+
+
+MIT License - see LICENSE file for details.**Rate Limit:** 20 requests per minute + complexity-based throttling  
 **Authentication:** API key required (if configured)
 
 **Sample Request:**

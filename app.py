@@ -1,1786 +1,712 @@
 import asyncio
-import base64
-import csv
 import hashlib
 import hmac
-import io
 import json
+import logging
 import os
-import pathlib
 import re
-import shutil
-import sys
-import tempfile
-import threading
+import secrets
+import subprocess
 import time
 import uuid
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Literal, Optional
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from functools import wraps
+from pathlib import Path
+from threading import Event
+from typing import Any, Dict, List, Optional, Set, Literal
+from urllib.parse import urlparse
 
 import httpx
+import prometheus_client
 import uvicorn
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Header, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response, StreamingResponse
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from loguru import logger
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field, field_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
 
-# =========================
-# Config
-# =========================
-APP_PORT = int(os.getenv("PORT", "8000"))
-
-# Security configuration
-API_KEY = os.getenv("API_KEY", "")  # Optional API key protection
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
-RATE_LIMIT_REQUESTS = os.getenv("RATE_LIMIT_REQUESTS", "30/minute")
-
-# Signed links configuration
-SIGNED_LINKS_ENABLED = os.getenv("SIGNED_LINKS_ENABLED", "false").lower() == "true"
-LINK_SIGNING_KEY = os.getenv("LINK_SIGNING_KEY", "").strip()
-if SIGNED_LINKS_ENABLED and not LINK_SIGNING_KEY:
-    import secrets
-    LINK_SIGNING_KEY = secrets.token_hex(32)
-    logger.warning("SIGNED_LINKS_ENABLED but no LINK_SIGNING_KEY provided, using random key (not persistent)")
-
-# Destination selection
-DEFAULT_DEST = (os.getenv("DEFAULT_DEST") or "LOCAL").upper()  # "LOCAL" or "DRIVE"
-
-# Local (internal storage) config
-PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").rstrip("/")
-PUBLIC_FILES_DIR = os.getenv("PUBLIC_FILES_DIR", "/data/public")
-os.makedirs(PUBLIC_FILES_DIR, exist_ok=True)
-
-# Single-use token TTL (if nobody downloads within this TTL, file is deleted)
-ONCE_TOKEN_TTL_SEC = int(os.getenv("ONCE_TOKEN_TTL_SEC", "86400"))
-DELETE_AFTER_SERVE = os.getenv("DELETE_AFTER_SERVE", "true").lower() == "true"
-
-# Google Drive (optional)
-DRIVE_ENABLED = (
-    os.getenv("DRIVE_ENABLED") or ("oauth" if os.getenv("GOOGLE_REFRESH_TOKEN") else "")
-).lower() in ("oauth", "service")
-DRIVE_AUTH = (os.getenv("DRIVE_AUTH") or "oauth").lower()  # "oauth" | "service"
-DRIVE_FOLDER_ID_DEFAULT = (os.getenv("DRIVE_FOLDER_ID") or "").strip() or None
-DRIVE_PUBLIC = (os.getenv("DRIVE_PUBLIC") or "false").lower() == "true"
-
-# Timeouts
-DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT_SEC") or 5400)
+from process import StreamingPipeline
 
 # =========================
-# Logging Configuration
+# Configuration
 # =========================
-logger.remove()  # Remove default handler
-logger.add(
-    sys.stdout,
-    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    serialize=False,
+
+# Core settings
+API_KEY = os.getenv("API_KEY", "")
+if not API_KEY:
+    raise RuntimeError("API_KEY environment variable is required")
+
+ALLOW_YT_DOWNLOADS = os.getenv("ALLOW_YT_DOWNLOADS", "false").lower() == "true"
+RCLONE_REMOTE_DEFAULT = os.getenv("RCLONE_REMOTE_DEFAULT", "")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+WORKERS = int(os.getenv("WORKERS", "2"))
+
+# Rate limiting
+RATE_LIMIT_RPS = int(os.getenv("RATE_LIMIT_RPS", "2"))
+RATE_LIMIT_BURST = int(os.getenv("RATE_LIMIT_BURST", "5"))
+
+# Timeouts and limits
+DEFAULT_TIMEOUT_SEC = int(os.getenv("DEFAULT_TIMEOUT_SEC", "1800"))
+MAX_CONTENT_LENGTH = int(os.getenv("MAX_CONTENT_LENGTH", "10737418240"))  # 10GB
+PROGRESS_TIMEOUT_SEC = int(os.getenv("PROGRESS_TIMEOUT_SEC", "300"))  # 5min no progress = abort
+
+# Logging
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+LOG_DIR = Path(os.getenv("LOG_DIR", "./logs"))
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+# Domain allowlist (optional)
+ALLOWED_DOMAINS = os.getenv("ALLOWED_DOMAINS", "").split(",") if os.getenv("ALLOWED_DOMAINS") else []
+
+# =========================
+# Logging Setup
+# =========================
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL.upper()),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s [%(filename)s:%(lineno)d]',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(LOG_DIR / "app.log")
+    ]
 )
-logger.add(
-    "logs/app.log",
-    format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    rotation="100 MB",
-    retention="7 days",
-    compression="zip",
+logger = logging.getLogger(__name__)
+
+# =========================
+# Metrics
+# =========================
+JOBS_TOTAL = prometheus_client.Counter('jobs_total', 'Total jobs processed', ['status'])
+JOBS_DURATION = prometheus_client.Histogram('jobs_duration_seconds', 'Job duration')
+BYTES_UPLOADED = prometheus_client.Counter('bytes_uploaded_total', 'Total bytes uploaded')
+JOBS_IN_FLIGHT = prometheus_client.Gauge('jobs_in_flight', 'Jobs currently running')
+
+# =========================
+# State Management
+# =========================
+job_states: Dict[str, Dict[str, Any]] = {}
+executor: Optional[ThreadPoolExecutor] = None
+shutdown_event = Event()
+
+# Rate limiting
+limiter = Limiter(
+    key_func=get_remote_address,
+    default_limits=[f"{RATE_LIMIT_RPS}/second"]
 )
 
-# Create logs directory
-os.makedirs("logs", exist_ok=True)
+# =========================
+# Models
+# =========================
+class DownloadRequest(BaseModel):
+    url: str = Field(..., description="Source URL to download")
+    dest: str = Field("BUCKET", description="Destination type")
+    remote: Optional[str] = Field(None, description="rclone remote name")
+    path: str = Field("videos/{safe_title}-{id}.{ext}", description="Object path template")
+    format: str = Field("bv*+ba/best", description="yt-dlp format selector")
+    webhook: Optional[str] = Field(None, description="Webhook URL for completion notification")
+    headers: Dict[str, str] = Field(default_factory=dict, description="Custom headers for object storage")
+    cookies: Optional[str] = Field(None, description="Cookies for yt-dlp")
+    timeout_sec: int = Field(DEFAULT_TIMEOUT_SEC, ge=60, le=7200, description="Timeout in seconds")
+    content_type: Optional[str] = Field(None, description="Content-Type header override")
+
+    @field_validator('url')
+    @classmethod
+    def validate_url(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("URL is required")
+        
+        v = v.strip()
+        if not (v.startswith('http://') or v.startswith('https://')):
+            raise ValueError("URL must start with http:// or https://")
+        
+        parsed = urlparse(v)
+        
+        # Check YouTube ToS compliance
+        if not ALLOW_YT_DOWNLOADS and any(
+            domain in parsed.netloc.lower() 
+            for domain in ['youtube.com', 'youtu.be', 'googlevideo.com']
+        ):
+            raise ValueError("YouTube downloads are disabled per Terms of Service")
+        
+        # Check domain allowlist if configured
+        if ALLOWED_DOMAINS and not any(
+            domain in parsed.netloc.lower() 
+            for domain in ALLOWED_DOMAINS
+        ):
+            raise ValueError(f"Domain not allowed. Allowed domains: {', '.join(ALLOWED_DOMAINS)}")
+        
+        return v
+
+    @field_validator('dest')
+    @classmethod
+    def validate_dest(cls, v: str) -> str:
+        if v not in ["BUCKET"]:
+            raise ValueError("Only 'BUCKET' destination is supported")
+        return v
+
+class DownloadResponse(BaseModel):
+    status: str = Field(..., description="Job status: QUEUED, RUNNING, DONE, ERROR")
+    request_id: str = Field(..., description="Unique request identifier")
+    object_url: Optional[str] = Field(None, description="URL to access the uploaded object")
+    bytes: Optional[int] = Field(None, description="Bytes uploaded")
+    duration_sec: Optional[float] = Field(None, description="Processing duration")
+    logs_url: Optional[str] = Field(None, description="URL to access job logs")
+    error: Optional[str] = Field(None, description="Error message if status is ERROR")
+    created_at: Optional[str] = Field(None, description="Job creation timestamp")
+    completed_at: Optional[str] = Field(None, description="Job completion timestamp")
+
+class HealthResponse(BaseModel):
+    status: str
+    version: str
+    timestamp: str
+    checks: Dict[str, str]
 
 # =========================
-# Configuration Validation
+# Security & Rate Limiting
 # =========================
-def validate_configuration():
-    """Validate environment configuration and log warnings for potential issues"""
-    warnings = []
-    errors = []
-    
-    # Critical validations
-    if not os.path.exists(PUBLIC_FILES_DIR):
-        try:
-            os.makedirs(PUBLIC_FILES_DIR, exist_ok=True)
-            logger.info(f"Created PUBLIC_FILES_DIR: {PUBLIC_FILES_DIR}")
-        except Exception as e:
-            errors.append(f"Cannot create PUBLIC_FILES_DIR {PUBLIC_FILES_DIR}: {e}")
-    
-    # Security validations
-    if not API_KEY and os.getenv("RAILWAY_ENVIRONMENT_NAME") == "production":
-        warnings.append("No API_KEY set in production environment - consider setting one for security")
-    
-    if SIGNED_LINKS_ENABLED and not LINK_SIGNING_KEY:
-        errors.append("SIGNED_LINKS_ENABLED is true but LINK_SIGNING_KEY is not provided")
-    
-    if SIGNED_LINKS_ENABLED and len(LINK_SIGNING_KEY) < 32:
-        warnings.append("LINK_SIGNING_KEY is shorter than recommended 32+ characters")
-    
-    # Drive configuration validation
-    if DRIVE_ENABLED:
-        if DRIVE_AUTH == "oauth":
-            required_oauth = ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_REFRESH_TOKEN"]
-            missing_oauth = [var for var in required_oauth if not os.getenv(var)]
-            if missing_oauth:
-                errors.append(f"DRIVE_ENABLED with oauth auth but missing: {', '.join(missing_oauth)}")
-        elif DRIVE_AUTH == "service":
-            if not os.getenv("DRIVE_SERVICE_ACCOUNT_JSON") and not os.getenv("DRIVE_SERVICE_ACCOUNT_JSON_B64"):
-                errors.append("DRIVE_ENABLED with service auth but no service account JSON provided")
-    
-    # Performance warnings
-    if DOWNLOAD_TIMEOUT > 7200:  # 2 hours
-        warnings.append(f"DOWNLOAD_TIMEOUT_SEC is quite high ({DOWNLOAD_TIMEOUT}s) - consider lowering for better resource management")
-    
-    if ONCE_TOKEN_TTL_SEC > 604800:  # 7 days
-        warnings.append(f"ONCE_TOKEN_TTL_SEC is very high ({ONCE_TOKEN_TTL_SEC}s) - files may accumulate")
-    
-    # CORS validation
-    if CORS_ORIGINS == ["*"] and API_KEY and os.getenv("RAILWAY_ENVIRONMENT_NAME") == "production":
-        warnings.append("CORS_ORIGINS is '*' in production with API_KEY - consider restricting origins")
-    
-    # Rate limit validation
-    try:
-        limit_parts = RATE_LIMIT_REQUESTS.split("/")
-        if len(limit_parts) != 2:
-            warnings.append(f"RATE_LIMIT_REQUESTS format may be invalid: {RATE_LIMIT_REQUESTS}")
-        else:
-            requests = int(limit_parts[0])
-            if requests > 100:
-                warnings.append(f"RATE_LIMIT_REQUESTS is quite high ({requests}) - consider lowering for protection")
-    except Exception:
-        warnings.append(f"RATE_LIMIT_REQUESTS format is invalid: {RATE_LIMIT_REQUESTS}")
-    
-    # Log results
-    if errors:
-        for error in errors:
-            logger.error(f"Configuration error: {error}")
-        logger.error("Application cannot start due to configuration errors")
-        sys.exit(1)
-    
-    if warnings:
-        for warning in warnings:
-            logger.warning(f"Configuration warning: {warning}")
-    
-    logger.info("Configuration validation completed successfully")
-
-# Run configuration validation
-validate_configuration()
+def require_api_key(func):
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        request = kwargs.get('request') or (args[0] if args else None)
+        if not request:
+            raise HTTPException(status_code=500, detail="Internal error: no request object")
+        
+        auth_header = request.headers.get("X-API-Key")
+        if not auth_header:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="X-API-Key header required"
+            )
+        
+        # Constant-time comparison
+        if not hmac.compare_digest(auth_header, API_KEY):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid API key"
+            )
+        
+        return await func(*args, **kwargs)
+    return wrapper
 
 # =========================
-# Rate Limiting Setup
-# =========================
-limiter = Limiter(key_func=get_remote_address)
-
-# =========================
-# Security
-# =========================
-security = HTTPBearer(auto_error=False)
-
-
-async def verify_api_key(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
-    """Optional API key verification"""
-    if not API_KEY:
-        return True  # No API key required
-
-    if not credentials:
-        raise HTTPException(status_code=401, detail="API key required")
-
-    if credentials.credentials != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-
-    return True
-
-
-# =========================
-# In-memory registries
-# =========================
-# Single-use token registry: token -> meta
-# meta: { path, size, active, consumed, last_seen, expiry, tag, file_id }
-ONCE_TOKENS: Dict[str, Dict[str, Any]] = {}
-
-# File registry: file_id -> { path, size, tokens, created_at }
-# tokens: set of token IDs that reference this file
-FILE_REGISTRY: Dict[str, Dict[str, Any]] = {}
-
-# Job status registry: tag -> {status, payload, updated_at, dest, expected_name}
-# status: queued | downloading | ready | error
-JOBS: Dict[str, Dict[str, Any]] = {}
-
-
-# =========================
-# Utils
+# Path Templating
 # =========================
 def sanitize_filename(name: str) -> str:
-    safe = re.sub(r"[^a-zA-Z0-9._-]", "_", name)
-    return safe.strip(" .")
+    """Sanitize filename for object storage keys."""
+    if not name:
+        return "unknown"
+    
+    # Replace problematic characters
+    safe = re.sub(r'[^\w\-_\.]', '_', name)
+    # Collapse multiple underscores
+    safe = re.sub(r'_+', '_', safe)
+    # Remove leading/trailing underscores and dots
+    safe = safe.strip('_.')
+    
+    return safe[:200] if safe else "unknown"  # Limit length
 
-
-async def run(cmd: List[str], timeout: Optional[int] = None) -> tuple[int, str, str]:
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-    )
-    try:
-        so, se = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
+def expand_path_template(template: str, metadata: Dict[str, Any]) -> str:
+    """Expand path template with metadata tokens."""
+    
+    # Extract common metadata with fallbacks
+    video_id = metadata.get('id', 'unknown')
+    title = metadata.get('title', 'Unknown Title')
+    safe_title = sanitize_filename(title)
+    ext = metadata.get('ext', 'mp4')
+    uploader = sanitize_filename(metadata.get('uploader', 'unknown'))
+    
+    # Generate date string
+    upload_date = metadata.get('upload_date')
+    if upload_date:
         try:
-            proc.kill()
-        except Exception:
-            pass
-        return 124, "", "Timeout"
-    return proc.returncode, so.decode(errors="ignore"), se.decode(errors="ignore")
-
-
-async def safe_callback(url: str, payload: dict):
-    if not url:
-        return
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            await client.post(url, json=payload)
-    except Exception:
-        # best effort only
-        pass
-
-
-def job_set(tag: str, **kw):
-    """Enhanced job metadata management with TTL tracking"""
-    rec = JOBS.get(tag, {"tag": tag})
-    
-    # Set creation timestamp if this is a new job
-    if "tag" not in rec or not rec.get("created_at"):
-        rec["created_at"] = time.time()
-    
-    rec.update(kw)
-    rec["updated_at"] = time.time()
-    
-    # Enhanced TTL metadata
-    if "status" in kw:
-        status = kw["status"]
-        rec[f"status_{status}_at"] = time.time()
-        
-        # Set TTL based on status and intent
-        intent = rec.get("intent", "download")
-        if status == "ready":
-            # Different TTL based on intent
-            default_ttl = {
-                "preview": 3600,      # 1 hour for previews
-                "download": 86400,    # 24 hours for downloads  
-                "archive": 604800     # 7 days for archives
-            }.get(intent, 86400)
-            
-            rec["ttl_sec"] = rec.get("custom_ttl") or default_ttl
-            rec["expires_at"] = time.time() + rec["ttl_sec"]
-        elif status == "error":
-            # Short TTL for error jobs to cleanup quickly
-            rec["ttl_sec"] = 3600  # 1 hour
-            rec["expires_at"] = time.time() + rec["ttl_sec"]
-    
-    JOBS[tag] = rec
-
-
-# =========================
-# Discover endpoint helpers
-# =========================
-def _parse_dateafter(s: Optional[str]) -> Optional[str]:
-    """Parse dateafter parameter into yt-dlp format, gracefully ignoring invalid patterns."""
-    if not s or not s.strip():
-        return None
-
-    s = s.strip()
-
-    # Handle YYYYMMDD format
-    if re.match(r"^\d{8}$", s):
-        return s
-
-    # Handle now-<days>days format
-    match = re.match(r"^now-(\d+)days?$", s)
-    if match:
-        days = int(match.group(1))
-        target_date = datetime.utcnow() - timedelta(days=days)
-        return target_date.strftime("%Y%m%d")
-
-    # Invalid format - gracefully ignore
-    return None
-
-
-def _synthesize_match_filter(
-    base: Optional[str], min_duration: Optional[int], max_duration: Optional[int]
-) -> Optional[str]:
-    """Synthesize match filter combining user expression with duration constraints."""
-    filters = []
-
-    # Add user-provided filter
-    if base and base.strip():
-        filters.append(f"({base.strip()})")
-
-    # Add duration constraints
-    if min_duration is not None and min_duration >= 0:
-        filters.append(f"(duration >= {min_duration})")
-
-    if max_duration is not None and max_duration >= 0:
-        filters.append(f"(duration <= {max_duration})")
-
-    if not filters:
-        return None
-
-    return " & ".join(filters)
-
-
-def _rows_to_csv(rows: List[Dict[str, Any]], fields: Optional[str]) -> bytes:
-    """Convert list of dicts to CSV bytes."""
-    if not rows:
-        return b""
-
-    # Determine fields to include
-    if fields and fields.strip():
-        field_list = [f.strip() for f in fields.split(",") if f.strip()]
+            date_obj = datetime.strptime(str(upload_date), '%Y%m%d')
+            date_str = date_obj.strftime('%Y-%m-%d')
+        except (ValueError, TypeError):
+            date_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
     else:
-        # Default fields
-        field_list = [
-            "id",
-            "title",
-            "url",
-            "duration",
-            "view_count",
-            "like_count",
-            "uploader",
-            "upload_date",
-        ]
-
-    # Filter to only include fields that exist in at least one row
-    available_fields = set()
-    for row in rows:
-        available_fields.update(row.keys())
-
-    field_list = [f for f in field_list if f in available_fields]
-
-    # Generate CSV
-    output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=field_list, extrasaction="ignore")
-    writer.writeheader()
-
-    for row in rows:
-        writer.writerow(row)
-
-    return output.getvalue().encode("utf-8")
-
-
-# =========================
-# Single-use link helpers (LOCAL)
-# =========================
-def _file_stat(path: str) -> tuple[int, str]:
-    p = pathlib.Path(path)
-    if not p.exists() or not p.is_file():
-        raise FileNotFoundError
-    return (p.stat().st_size, p.name)
-
-
-def _generate_signature(token: str, expiry: float) -> str:
-    """Generate HMAC signature for signed links"""
-    if not SIGNED_LINKS_ENABLED or not LINK_SIGNING_KEY:
-        return ""
+        date_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
     
-    import hmac
-    import hashlib
+    # Generate random component
+    random_str = secrets.token_hex(4)
     
-    message = f"{token}:{int(expiry)}"
-    signature = hmac.new(
-        LINK_SIGNING_KEY.encode(),
-        message.encode(),
-        hashlib.sha256
-    ).hexdigest()[:16]  # Truncate to 16 chars for shorter URLs
-    
-    return signature
-
-
-def _verify_signature(token: str, expiry: float, signature: str) -> bool:
-    """Verify HMAC signature for signed links"""
-    if not SIGNED_LINKS_ENABLED or not LINK_SIGNING_KEY:
-        return True  # Skip verification if signing is disabled
-    
-    expected_signature = _generate_signature(token, expiry)
-    return hmac.compare_digest(signature, expected_signature)
-
-
-def _build_once_url(token: str, expiry: Optional[float] = None) -> str:
-    """Build download URL with optional signature"""
-    base_url = f"/once/{token}" if not PUBLIC_BASE_URL else f"{PUBLIC_BASE_URL}/once/{token}"
-    
-    if SIGNED_LINKS_ENABLED and expiry:
-        signature = _generate_signature(token, expiry)
-        return f"{base_url}?sig={signature}&exp={int(expiry)}"
-    
-    return base_url
-
-
-def make_single_use_url(filename: str, tag: str, ttl_sec: Optional[int] = None) -> str:
-    """Create a single-use URL for a file with optional custom TTL"""
-    path = os.path.join(PUBLIC_FILES_DIR, filename)
-    size, _ = _file_stat(path)
-    
-    # Generate unique file ID based on path for multi-token support
-    file_id = f"file_{hash(path) & 0x7FFFFFFF:08x}"
-    
-    # Register file if not already registered
-    if file_id not in FILE_REGISTRY:
-        FILE_REGISTRY[file_id] = {
-            "path": path,
-            "size": size,
-            "tokens": set(),
-            "created_at": time.time(),
-        }
-    
-    # Create token
-    token = uuid.uuid4().hex
-    effective_ttl = ttl_sec if ttl_sec is not None else ONCE_TOKEN_TTL_SEC
-    
-    ONCE_TOKENS[token] = {
-        "path": path,
-        "size": size,
-        "active": 0,  # concurrent streams
-        "consumed": False,  # true once any bytes were sent
-        "last_seen": time.time(),
-        "expiry": time.time() + effective_ttl,
-        "tag": tag,
-        "file_id": file_id,
+    # Template expansion
+    replacements = {
+        '{id}': video_id,
+        '{title}': title,
+        '{safe_title}': safe_title,
+        '{ext}': ext,
+        '{uploader}': uploader,
+        '{date}': date_str,
+        '{random}': random_str,
     }
     
-    # Link token to file
-    FILE_REGISTRY[file_id]["tokens"].add(token)
+    expanded = template
+    for token, value in replacements.items():
+        expanded = expanded.replace(token, str(value))
     
-    return _build_once_url(token, time.time() + effective_ttl)
+    # Final sanitization of the full path
+    return re.sub(r'/+', '/', expanded.strip('/'))
 
+# =========================
+# Job Management
+# =========================
+def create_job(request_id: str, payload: DownloadRequest) -> Dict[str, Any]:
+    """Create a new job record."""
+    now = datetime.now(timezone.utc)
+    job = {
+        'request_id': request_id,
+        'status': 'QUEUED',
+        'payload': payload.model_dump(),
+        'created_at': now.isoformat(),
+        'logs': [],
+        'bytes': 0,
+        'object_path': None,
+        'object_url': None,
+        'error': None,
+        'completed_at': None,
+        'duration_sec': None,
+    }
+    job_states[request_id] = job
+    return job
 
-def make_multiple_use_urls(filename: str, tag: str, count: int = 1, ttl_sec: Optional[int] = None) -> List[str]:
-    """Create multiple single-use URLs for the same file"""
-    if count <= 0:
-        raise ValueError("count must be positive")
+def update_job(request_id: str, **updates) -> Dict[str, Any]:
+    """Update job state."""
+    if request_id not in job_states:
+        raise ValueError(f"Job {request_id} not found")
     
-    urls = []
-    for _ in range(count):
-        urls.append(make_single_use_url(filename, tag, ttl_sec))
-    return urls
-
-
-def mint_additional_tokens(file_id: str, count: int = 1, ttl_sec: Optional[int] = None, tag: Optional[str] = None) -> List[str]:
-    """Mint additional tokens for an existing file"""
-    if file_id not in FILE_REGISTRY:
-        raise FileNotFoundError(f"File {file_id} not found in registry")
+    job = job_states[request_id]
+    job.update(updates)
     
-    file_info = FILE_REGISTRY[file_id]
-    path = file_info["path"]
-    
-    # Verify file still exists
-    if not os.path.exists(path):
-        # Clean up registry
-        FILE_REGISTRY.pop(file_id, None)
-        raise FileNotFoundError(f"File at {path} no longer exists")
-    
-    size = file_info["size"]
-    effective_ttl = ttl_sec if ttl_sec is not None else ONCE_TOKEN_TTL_SEC
-    effective_tag = tag or f"mint_{file_id}"
-    
-    urls = []
-    for _ in range(count):
-        token = uuid.uuid4().hex
-        ONCE_TOKENS[token] = {
-            "path": path,
-            "size": size,
-            "active": 0,
-            "consumed": False,
-            "last_seen": time.time(),
-            "expiry": time.time() + effective_ttl,
-            "tag": effective_tag,
-            "file_id": file_id,
-        }
-        FILE_REGISTRY[file_id]["tokens"].add(token)
-        urls.append(_build_once_url(token, time.time() + effective_ttl))
-    
-    return urls
-
-
-def _maybe_delete_and_purge(token: str):
-    """Delete file and clean up token if conditions are met"""
-    meta = ONCE_TOKENS.get(token)
-    if not meta:
-        return
-    
-    # Only mark as consumed if active streams finished and bytes were sent
-    if meta["active"] == 0 and meta["consumed"]:
-        file_id = meta["file_id"]
+    # Auto-set completion timestamp and duration for terminal states
+    if updates.get('status') in ['DONE', 'ERROR'] and not job.get('completed_at'):
+        now = datetime.now(timezone.utc)
+        job['completed_at'] = now.isoformat()
         
-        # Remove token from registry
-        ONCE_TOKENS.pop(token, None)
+        created_at = datetime.fromisoformat(job['created_at'].replace('Z', '+00:00'))
+        job['duration_sec'] = (now - created_at).total_seconds()
+    
+    return job
+
+def get_job(request_id: str) -> Optional[Dict[str, Any]]:
+    """Get job by request_id."""
+    return job_states.get(request_id)
+
+def add_job_log(request_id: str, message: str, level: str = "INFO"):
+    """Add a log entry to job."""
+    if request_id in job_states:
+        timestamp = datetime.now(timezone.utc).isoformat()
+        log_entry = f"[{timestamp}] {level}: {message}"
         
-        # Update file registry
-        if file_id in FILE_REGISTRY:
-            FILE_REGISTRY[file_id]["tokens"].discard(token)
-            
-            # Check if this was the last token for the file
-            if not FILE_REGISTRY[file_id]["tokens"]:
-                # No more tokens, safe to delete file
-                try:
-                    if os.path.exists(meta["path"]):
-                        os.remove(meta["path"])
-                        logger.info(f"Deleted file {meta['path']} (last token consumed)")
-                except Exception as e:
-                    logger.error(f"Failed to delete file {meta['path']}: {e}")
-                
-                # Remove from file registry
-                FILE_REGISTRY.pop(file_id, None)
-
-
-def _janitor_loop():
-    """Enhanced janitor loop for cleaning up expired tokens, orphaned files, and stale jobs"""
-    while True:
+        job_states[request_id]['logs'].append(log_entry)
+        
+        # Keep only last 100 log entries in memory
+        if len(job_states[request_id]['logs']) > 100:
+            job_states[request_id]['logs'] = job_states[request_id]['logs'][-100:]
+        
+        # Write to persistent log file
+        log_file = LOG_DIR / f"{request_id}.log"
         try:
-            now = time.time()
-            expired_tokens = []
-            expired_jobs = []
-            
-            # Find expired tokens
-            for token, meta in list(ONCE_TOKENS.items()):
-                if now > meta.get("expiry", 0):
-                    expired_tokens.append(token)
-            
-            # Process expired tokens
-            for token in expired_tokens:
-                meta = ONCE_TOKENS.pop(token, None)
-                if not meta:
-                    continue
-                
-                file_id = meta.get("file_id")
-                if file_id and file_id in FILE_REGISTRY:
-                    FILE_REGISTRY[file_id]["tokens"].discard(token)
-                    
-                    # Delete file if not consumed and no more tokens
-                    if not meta["consumed"] and not FILE_REGISTRY[file_id]["tokens"]:
-                        try:
-                            if os.path.exists(meta["path"]):
-                                os.remove(meta["path"])
-                                logger.info(f"Deleted expired file {meta['path']}")
-                        except Exception as e:
-                            logger.error(f"Failed to delete expired file {meta['path']}: {e}")
-                        
-                        FILE_REGISTRY.pop(file_id, None)
-            
-            # Clean up orphaned file registry entries
-            orphaned_files = []
-            for file_id, file_info in list(FILE_REGISTRY.items()):
-                if not file_info["tokens"]:  # No tokens reference this file
-                    orphaned_files.append(file_id)
-            
-            for file_id in orphaned_files:
-                file_info = FILE_REGISTRY.pop(file_id, None)
-                if file_info:
-                    try:
-                        if os.path.exists(file_info["path"]):
-                            os.remove(file_info["path"])
-                            logger.info(f"Deleted orphaned file {file_info['path']}")
-                    except Exception as e:
-                        logger.error(f"Failed to delete orphaned file {file_info['path']}: {e}")
-            
-            # Enhanced job cleanup with TTL awareness
-            for tag, job in list(JOBS.items()):
-                should_expire = False
-                
-                # Check explicit expiry time
-                if job.get("expires_at") and now > job["expires_at"]:
-                    should_expire = True
-                    logger.debug(f"Job {tag} expired based on TTL")
-                
-                # Check age-based cleanup for stale jobs
-                created_at = job.get("created_at", 0)
-                age_hours = (now - created_at) / 3600 if created_at else 0
-                
-                status = job.get("status", "queued")
-                max_age_hours = {
-                    "queued": 24,     # 1 day for queued jobs
-                    "processing": 48, # 2 days for processing jobs
-                    "ready": 168,     # 7 days for ready jobs (unless TTL is shorter)
-                    "error": 24,      # 1 day for error jobs
-                }.get(status, 24)
-                
-                if age_hours > max_age_hours:
-                    should_expire = True
-                    logger.debug(f"Job {tag} expired based on age: {age_hours:.1f} hours")
-                
-                if should_expire:
-                    expired_jobs.append(tag)
-            
-            # Remove expired jobs
-            for tag in expired_jobs:
-                job = JOBS.pop(tag, None)
-                if job:
-                    logger.info(f"Cleaned up expired job: {tag} (status: {job.get('status')}, intent: {job.get('intent')})")
-            
-            # Summary logging
-            if expired_tokens or orphaned_files or expired_jobs:
-                logger.info(f"Janitor cleanup: {len(expired_tokens)} tokens, {len(orphaned_files)} files, {len(expired_jobs)} jobs")
-                
+            with open(log_file, 'a', encoding='utf-8') as f:
+                f.write(log_entry + '\n')
         except Exception as e:
-            logger.error(f"Janitor loop error: {e}")
+            logger.error(f"Failed to write to log file {log_file}: {e}")
+
+# =========================
+# Background Job Processor
+# =========================
+async def process_download_job(request_id: str, payload: DownloadRequest):
+    """Process a download job using streaming pipeline."""
+    
+    try:
+        update_job(request_id, status='RUNNING')
+        add_job_log(request_id, f"Starting download: {payload.url}")
+        JOBS_IN_FLIGHT.inc()
         
-        time.sleep(60)
-
-
-threading.Thread(target=_janitor_loop, daemon=True).start()
-
-# =========================
-# Google Drive (optional)
-# =========================
-_drive_service = None
-
-
-def _build_drive():
-    global _drive_service
-    if _drive_service or not DRIVE_ENABLED:
-        return _drive_service
-    from google.oauth2 import service_account
-    from google.oauth2.credentials import Credentials
-    from googleapiclient.discovery import build
-
-    if DRIVE_AUTH == "oauth":
-        client_id = os.getenv("GOOGLE_CLIENT_ID")
-        client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
-        refresh_token = os.getenv("GOOGLE_REFRESH_TOKEN")
-        scopes = (
-            os.getenv("GOOGLE_SCOPES") or "https://www.googleapis.com/auth/drive.file"
-        ).split()
-        if not (client_id and client_secret and refresh_token):
-            raise RuntimeError("OAuth selected but GOOGLE_CLIENT_ID/SECRET/REFRESH_TOKEN missing")
-        creds = Credentials(
-            None,
-            refresh_token=refresh_token,
-            token_uri="https://oauth2.googleapis.com/token",
-            client_id=client_id,
-            client_secret=client_secret,
-            scopes=scopes,
+        # Determine remote and validate rclone config
+        remote = payload.remote or RCLONE_REMOTE_DEFAULT
+        if not remote:
+            raise ValueError("No rclone remote specified and no default configured")
+        
+        add_job_log(request_id, f"Using rclone remote: {remote}")
+        
+        # Create streaming pipeline
+        pipeline = StreamingPipeline(
+            request_id=request_id,
+            source_url=payload.url,
+            rclone_remote=remote,
+            path_template=payload.path,
+            yt_dlp_format=payload.format,
+            timeout_sec=payload.timeout_sec,
+            progress_timeout_sec=PROGRESS_TIMEOUT_SEC,
+            max_content_length=MAX_CONTENT_LENGTH,
+            headers=payload.headers,
+            cookies=payload.cookies,
+            content_type=payload.content_type,
+            log_callback=lambda msg, level="INFO": add_job_log(request_id, msg, level)
         )
-        _drive_service = build("drive", "v3", credentials=creds, cache_discovery=False)
-        return _drive_service
-    # service account
-    service_json = os.getenv("DRIVE_SERVICE_ACCOUNT_JSON")
-    if not service_json and os.getenv("DRIVE_SERVICE_ACCOUNT_JSON_B64"):
-        service_json = base64.b64decode(os.getenv("DRIVE_SERVICE_ACCOUNT_JSON_B64")).decode("utf-8")
-    if not service_json:
-        raise RuntimeError(
-            "Service auth selected but DRIVE_SERVICE_ACCOUNT_JSON(_B64) not provided"
+        
+        # Execute pipeline
+        result = await pipeline.execute()
+        
+        # Generate object URL
+        object_url = None
+        if result.get('object_path'):
+            object_url = await get_object_url(remote, result['object_path'])
+        
+        # Update job with success
+        update_job(
+            request_id,
+            status='DONE',
+            bytes=result.get('bytes_transferred', 0),
+            object_path=result.get('object_path'),
+            object_url=object_url
         )
-    creds_info = json.loads(service_json)
-    scopes = ["https://www.googleapis.com/auth/drive"]
-    sa = service_account.Credentials.from_service_account_info(creds_info, scopes=scopes)
-    _drive_service = build("drive", "v3", credentials=sa, cache_discovery=False)
-    return _drive_service
+        
+        add_job_log(request_id, f"Download completed successfully. Bytes: {result.get('bytes_transferred', 0)}")
+        JOBS_TOTAL.labels(status='success').inc()
+        BYTES_UPLOADED.inc(result.get('bytes_transferred', 0))
+        
+        # Send webhook if configured
+        if payload.webhook:
+            await send_webhook(payload.webhook, request_id, 'DONE')
+        
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"Job {request_id} failed: {error_msg}", exc_info=True)
+        
+        update_job(request_id, status='ERROR', error=error_msg)
+        add_job_log(request_id, f"Job failed: {error_msg}", "ERROR")
+        JOBS_TOTAL.labels(status='error').inc()
+        
+        # Send webhook if configured
+        if payload.webhook:
+            await send_webhook(payload.webhook, request_id, 'ERROR', error_msg)
+    
+    finally:
+        JOBS_IN_FLIGHT.dec()
 
+async def get_object_url(remote: str, object_path: str) -> Optional[str]:
+    """Get public or signed URL for object using rclone link."""
+    try:
+        cmd = ['rclone', 'link', f"{remote}:{object_path}"]
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
+        
+        if process.returncode == 0:
+            url = stdout.decode().strip()
+            if url:
+                return url
+        
+        # Fallback to canonical path if rclone link not supported
+        logger.warning(f"rclone link failed for {remote}:{object_path}, using canonical path")
+        return f"{remote}:{object_path}"
+        
+    except Exception as e:
+        logger.error(f"Failed to get object URL: {e}")
+        return f"{remote}:{object_path}"
 
-def drive_upload(local_path: str, out_name: str, folder_id: Optional[str]) -> dict:
-    svc = _build_drive()
-    from googleapiclient.http import MediaFileUpload
-
-    meta = {"name": out_name}
-    if folder_id:
-        meta["parents"] = [folder_id]
-    media = MediaFileUpload(local_path, resumable=True)
-    file = svc.files().create(body=meta, media_body=media, fields="id, webViewLink").execute()
-    if DRIVE_PUBLIC:
-        svc.permissions().create(
-            fileId=file["id"], body={"role": "reader", "type": "anyone"}
-        ).execute()
-    return {"file_id": file["id"], "webViewLink": file.get("webViewLink")}
-
+async def send_webhook(webhook_url: str, request_id: str, status: str, error: Optional[str] = None):
+    """Send webhook notification."""
+    try:
+        job = get_job(request_id)
+        if not job:
+            return
+        
+        payload = {
+            'request_id': request_id,
+            'status': status,
+            'created_at': job.get('created_at'),
+            'completed_at': job.get('completed_at'),
+            'object_url': job.get('object_url'),
+            'bytes': job.get('bytes', 0),
+            'duration_sec': job.get('duration_sec')
+        }
+        
+        if error:
+            payload['error'] = error
+        
+        async with httpx.AsyncClient(timeout=30) as client:
+            await client.post(webhook_url, json=payload)
+            
+        logger.info(f"Webhook sent successfully for job {request_id}")
+        
+    except Exception as e:
+        logger.error(f"Failed to send webhook for job {request_id}: {e}")
 
 # =========================
-# FastAPI app
+# FastAPI App
 # =========================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan handler."""
+    global executor
+    
+    # Startup
+    executor = ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="download-")
+    logger.info(f"Started download service with {WORKERS} workers")
+    
+    yield
+    
+    # Shutdown
+    logger.info("Shutting down download service...")
+    shutdown_event.set()
+    
+    if executor:
+        executor.shutdown(wait=True)
+    
+    logger.info("Download service shutdown complete")
+
 app = FastAPI(
-    title="Railway yt-dlp Service",
-    description="A FastAPI service for downloading media using yt-dlp with Google Drive integration",
-    version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
+    title="yt-dlp Streaming Service",
+    description="Production-ready yt-dlp service with rclone streaming to object storage",
+    version="2.0.0",
+    lifespan=lifespan
 )
 
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
+    allow_origins=["*"],  # Configure appropriately for production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Add rate limiting middleware
+# Add rate limiting
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
 
-
-# Security headers middleware
-@app.middleware("http")
-async def add_security_headers(request: Request, call_next):
-    response = await call_next(request)
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["X-XSS-Protection"] = "1; mode=block"
-    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    return response
-
-
-# Request logging middleware
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    start_time = time.time()
-    logger.info(f"Request: {request.method} {request.url}")
-
-    response = await call_next(request)
-
-    process_time = time.time() - start_time
-    logger.info(f"Response: {response.status_code} - {process_time:.3f}s")
-    return response
-
-
-@app.get("/")
-def root():
-    return {
-        "ok": True,
-        "service": "Railway yt-dlp Service",
-        "version": "1.0.0",
-        "default_dest": DEFAULT_DEST,
-        "drive_enabled": DRIVE_ENABLED,
-        "public_base_url": PUBLIC_BASE_URL or "(unset)",
-        "public_files_dir": PUBLIC_FILES_DIR,
-        "rate_limit": RATE_LIMIT_REQUESTS,
-        "api_key_required": bool(API_KEY),
-        "time": datetime.utcnow().isoformat(),
-    }
-
-
-@app.get("/healthz")
-@limiter.limit("60/minute")
-def healthz(request: Request):
-    """Enhanced health check endpoint"""
-    try:
-        # Check critical dependencies
-        health_status = {
-            "status": "healthy",
-            "timestamp": datetime.utcnow().isoformat(),
-            "version": "1.0.0",
-            "checks": {
-                "storage": "healthy" if os.path.exists(PUBLIC_FILES_DIR) else "unhealthy",
-                "drive": "enabled" if DRIVE_ENABLED else "disabled",
-                "memory": "healthy",  # Could add actual memory check
-            },
-        }
-
-        # Check if any critical checks failed
-        if any(
-            check == "unhealthy"
-            for check in health_status["checks"].values()
-            if check != "disabled"
-        ):
-            health_status["status"] = "unhealthy"
-            return JSONResponse(health_status, status_code=503)
-
-        return health_status
-    except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        return JSONResponse(
-            {"status": "unhealthy", "error": str(e), "timestamp": datetime.utcnow().isoformat()},
-            status_code=503,
-        )
-
-
-@app.get("/metrics")
-@limiter.limit("30/minute")
-def metrics(request: Request):
-    """Basic metrics endpoint for monitoring"""
-    try:
-        from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-
-        return StreamingResponse(iter([generate_latest()]), media_type=CONTENT_TYPE_LATEST)
-    except ImportError:
-        # Fallback metrics if prometheus client not available
-        return {
-            "jobs": {
-                "total": len(JOBS),
-                "by_status": {
-                    status: len([j for j in JOBS.values() if j.get("status") == status])
-                    for status in ["queued", "downloading", "ready", "error"]
-                },
-            },
-            "tokens": {
-                "active": len(ONCE_TOKENS),
-                "consumed": len([t for t in ONCE_TOKENS.values() if t.get("consumed", False)]),
-            },
-            "timestamp": datetime.utcnow().isoformat(),
-        }
-
-
-# =========================
-# Models
-# =========================
-class DownloadReq(BaseModel):
-    # Intent-based processing
-    intent: Literal["download", "preview", "archive"] = Field("download", description="Download intent")
-    url: str = Field(..., description="Source URL to download")
-    tag: Optional[str] = Field(default_factory=lambda: f"job_{uuid.uuid4().hex[:8]}", description="Unique job identifier")
-    expected_name: Optional[str] = Field(None, max_length=255, description="Expected output filename")
-    callback_url: Optional[str] = Field(None, description="Webhook URL for completion notification")
-    quality: Literal["BEST_ORIGINAL", "BEST_MP4", "STRICT_MP4_REENC"] = Field("BEST_MP4", description="Output quality preference")
-    timeout: Optional[int] = Field(DOWNLOAD_TIMEOUT, ge=60, le=7200, description="Download timeout in seconds")
-    dest: Optional[Literal["LOCAL", "DRIVE"]] = Field(None, description="Storage destination")
-    drive_folder: Optional[str] = Field(None, description="Google Drive folder ID")
-    # hardening knobs
-    retries: Optional[int] = Field(3, ge=1, le=10, description="Retry attempts per strategy")
-    socket_timeout: Optional[int] = Field(30, ge=10, le=300, description="Socket timeout in seconds")
-    prefer_api: Optional[bool] = Field(True, description="Prefer API over scraping")
-    # multi-artifact support
-    separate_audio_video: Optional[bool] = Field(False, description="Download audio/video as separate files")
-    audio_format: Optional[Literal["m4a", "mp3", "best"]] = Field("m4a", description="Audio format preference")
-    token_count: Optional[int] = Field(1, ge=1, le=5, description="Number of download tokens per artifact")
-    custom_ttl: Optional[int] = Field(None, ge=60, le=604800, description="Custom TTL for tokens in seconds")
-    
-    # Enhanced validation
-    @field_validator('url')
-    @classmethod
-    def validate_url(cls, v: str) -> str:
-        """Validate URL format and prevent obviously malicious URLs"""
-        # Don't validate empty strings here - let endpoint handle for backward compatibility
-        if v and v.strip():
-            v = v.strip()
-            if not (v.startswith('http://') or v.startswith('https://')):
-                raise ValueError("URL must start with http:// or https://")
-            if len(v) > 2048:
-                raise ValueError("URL too long (max 2048 characters)")
-        return v
-    
-    @field_validator('tag')
-    @classmethod
-    def validate_tag(cls, v: Optional[str]) -> Optional[str]:
-        """Validate tag format"""
-        if v is not None:
-            v = v.strip()
-            if not v:
-                return None
-            if len(v) > 100:
-                raise ValueError("Tag too long (max 100 characters)")
-            # Allow alphanumeric, dash, underscore only
-            import re
-            if not re.match(r'^[a-zA-Z0-9_-]+$', v):
-                raise ValueError("Tag can only contain letters, numbers, dashes, and underscores")
-        return v
-
-
-class DownloadAck(BaseModel):
-    accepted: bool
-    tag: str
-    expected_name: Optional[str]
-    note: str
-
-
-class MintTokenReq(BaseModel):
-    file_id: str = Field(..., description="File ID to mint tokens for")
-    count: int = Field(1, ge=1, le=10, description="Number of tokens to mint (1-10)")
-    ttl_sec: Optional[int] = Field(None, ge=60, le=604800, description="Custom TTL in seconds (60s to 7 days)")
-    tag: Optional[str] = Field(None, description="Optional tag for the new tokens")
-
-
-class MintTokenResponse(BaseModel):
-    success: bool
-    file_id: str
-    tokens_created: int
-    urls: List[str]
-    expires_in_sec: int
-
-
-class FileInfo(BaseModel):
-    file_id: str
-    filename: str
-    size: int
-    active_tokens: int
-    created_at: str
-
-
-class ListFilesResponse(BaseModel):
-    files: List[FileInfo]
-    total_files: int
-
-
 # =========================
 # Routes
 # =========================
-@app.post("/download", response_model=DownloadAck)
-@limiter.limit("10/minute")
-async def download(
-    request: Request, req: DownloadReq, bg: BackgroundTasks, _: bool = Depends(verify_api_key)
-):
-    """Intent-based media download from URL with enhanced validation"""
-    logger.info(f"Download request: intent={req.intent}, url={req.url}, tag={req.tag}")
 
-    # Backward-compatible URL validation for empty strings
-    if not req.url or not req.url.strip():
-        raise HTTPException(status_code=400, detail="Missing url")
-
-    # Intent-based validation
-    if req.intent == "preview" and req.separate_audio_video:
-        raise HTTPException(status_code=400, detail="Preview intent cannot use separate_audio_video")
-    
-    if req.intent == "archive" and req.token_count > 1:
-        raise HTTPException(status_code=400, detail="Archive intent should use single token")
-
-    # Enhanced URL validation (Pydantic validator already ran)
-    url = req.url.strip()
-    
-    # Additional intent-specific validation
-    if req.intent == "preview" and req.custom_ttl and req.custom_ttl > 3600:
-        raise HTTPException(status_code=400, detail="Preview intent TTL cannot exceed 1 hour")
-
-    # resolve filename with intent context
-    if req.expected_name:
-        expected = sanitize_filename(req.expected_name)
-    else:
-        # Intent-based filename generation
-        prefix = {"preview": "preview_", "archive": "archive_", "download": ""}.get(req.intent, "")
-        expected = f"{prefix}{req.tag}.mp4"
-    
-    expected = sanitize_filename(expected)
-    if not expected.lower().endswith(".mp4"):
-        expected += ".mp4"
-
-    # pick destination with intent awareness
-    dest = (req.dest or DEFAULT_DEST).upper()
-    if dest == "DRIVE" and not DRIVE_ENABLED:
-        raise HTTPException(
-            status_code=400, detail="Drive not configured; use LOCAL or enable Drive"
-        )
-
-    # Intent-specific constraints
-    if req.intent == "preview" and dest == "DRIVE":
-        raise HTTPException(status_code=400, detail="Preview intent must use LOCAL destination")
-
-    # Enhanced job metadata with intent
-    job_metadata = {
-        "status": "queued", 
-        "expected_name": expected, 
-        "dest": dest,
-        "intent": req.intent,
-        "created_at": time.time(),
-        "url_hash": hash(url) & 0x7FFFFFFF,  # For tracking
+@app.get("/", response_model=Dict[str, Any])
+async def root():
+    """Root endpoint with service information."""
+    return {
+        "service": "yt-dlp Streaming Service",
+        "version": "2.0.0",
+        "status": "healthy",
+        "features": {
+            "youtube_downloads": ALLOW_YT_DOWNLOADS,
+            "default_remote": RCLONE_REMOTE_DEFAULT or "(not configured)",
+            "workers": WORKERS,
+            "rate_limit_rps": RATE_LIMIT_RPS
+        },
+        "timestamp": datetime.now(timezone.utc).isoformat()
     }
-    
-    job_set(req.tag, **job_metadata)
-    bg.add_task(worker_job, req, expected, dest)
 
-    logger.info(f"Download job queued: {req.tag} (intent: {req.intent})")
-    return DownloadAck(
-        accepted=True, 
-        tag=req.tag, 
-        expected_name=expected, 
-        note=f"processing with intent: {req.intent}"
-    )
-
-
-@app.get("/status")
-@limiter.limit("60/minute")
-def get_status(request: Request, tag: str = Query(...)):
-    """Get download job status"""
-    rec = JOBS.get(tag)
-    if not rec:
-        return JSONResponse({"tag": tag, "status": "unknown"}, status_code=404)
-    return {"tag": tag, "status": rec.get("status"), "dest": rec.get("dest")}
-
-
-@app.get("/result")
-@limiter.limit("30/minute")
-def get_result(
-    request: Request, 
-    tag: str = Query(..., min_length=1, max_length=100, description="Job tag identifier"),
-    include_metadata: bool = Query(False, description="Include additional metadata"),
-    format: str = Query("json", description="Response format: json or minimal")
-):
-    """Get download job result with enhanced tag management and metadata"""
+@app.post("/download", response_model=DownloadResponse)
+@require_api_key
+@limiter.limit(f"{RATE_LIMIT_RPS}/second")
+async def create_download(request: Request, payload: DownloadRequest):
+    """Create a new download job."""
     
-    # Enhanced tag validation
-    import re
-    if not re.match(r'^[a-zA-Z0-9_-]+$', tag):
-        raise HTTPException(status_code=400, detail="Invalid tag format")
-    
-    rec = JOBS.get(tag)
-    if not rec:
-        return JSONResponse({"tag": tag, "status": "unknown"}, status_code=404)
-    
-    st = rec.get("status")
-    payload = rec.get("payload") or {}
-    
-    # Base response structure
-    response_data = {
-        "tag": tag,
-        "status": st or "queued"
-    }
-    
-    # Add enhanced metadata if requested
-    if include_metadata:
-        response_data.update({
-            "intent": rec.get("intent", "download"),
-            "created_at": rec.get("created_at"),
-            "updated_at": rec.get("updated_at"),
-            "dest": rec.get("dest"),
-            "url_hash": rec.get("url_hash"),
-        })
-        
-        # Add timing metadata if available
-        if rec.get("created_at") and rec.get("updated_at"):
-            response_data["processing_duration"] = rec.get("updated_at") - rec.get("created_at")
-    
-    if st == "ready":
-        result_data = {"tag": tag, "status": "ready", **payload}
-        if include_metadata:
-            result_data.update({
-                "intent": rec.get("intent", "download"),
-                "created_at": rec.get("created_at"),
-                "updated_at": rec.get("updated_at"),
-                "dest": rec.get("dest"),
-            })
-        
-        # Track result access for analytics
-        access_count = rec.get("access_count", 0) + 1
-        rec["access_count"] = access_count
-        rec["last_accessed"] = time.time()
-        
-        # Minimal format option
-        if format == "minimal":
-            minimal_data = {
-                "tag": tag,
-                "status": "ready",
-                "once_url": payload.get("once_url"),
-                "expires_in_sec": payload.get("expires_in_sec")
-            }
-            return JSONResponse(minimal_data, status_code=200)
-            
-        return JSONResponse(result_data, status_code=200)
-        
-    if st == "error":
-        error_data = {
-            "tag": tag,
-            "status": "error",
-            "error_message": payload.get("error_message", "unknown"),
-        }
-        if include_metadata:
-            error_data.update({
-                "intent": rec.get("intent", "download"),
-                "created_at": rec.get("created_at"),
-                "error_at": rec.get("updated_at"),
-                "dest": rec.get("dest"),
-            })
-        return JSONResponse(error_data, status_code=500)
-    
-    # For queued/processing status
-    if include_metadata:
-        response_data["dest"] = rec.get("dest")
-        response_data["expected_name"] = rec.get("expected_name")
-        
-    return JSONResponse(response_data, status_code=202)
-
-
-@app.post("/mint", response_model=MintTokenResponse)
-@limiter.limit("30/minute")
-def mint_tokens(
-    request: Request, 
-    req: MintTokenReq, 
-    _: bool = Depends(verify_api_key)
-):
-    """
-    Mint additional one-time tokens for an existing file.
-    Requires API key if configured.
-    """
-    logger.info(f"Minting {req.count} tokens for file {req.file_id}")
+    request_id = str(uuid.uuid4())
     
     try:
-        urls = mint_additional_tokens(
-            file_id=req.file_id,
-            count=req.count,
-            ttl_sec=req.ttl_sec,
-            tag=req.tag
+        # Create job record
+        job = create_job(request_id, payload)
+        
+        # Submit to executor
+        loop = asyncio.get_event_loop()
+        executor.submit(
+            asyncio.run_coroutine_threadsafe,
+            process_download_job(request_id, payload),
+            loop
         )
         
-        effective_ttl = req.ttl_sec if req.ttl_sec is not None else ONCE_TOKEN_TTL_SEC
+        # Build response
+        logs_url = None
+        if PUBLIC_BASE_URL:
+            logs_url = f"{PUBLIC_BASE_URL}/downloads/{request_id}/logs"
         
-        logger.info(f"Successfully minted {len(urls)} tokens for file {req.file_id}")
-        return MintTokenResponse(
-            success=True,
-            file_id=req.file_id,
-            tokens_created=len(urls),
-            urls=urls,
-            expires_in_sec=effective_ttl
+        logger.info(f"Created download job {request_id} for URL: {payload.url}")
+        
+        return DownloadResponse(
+            status="QUEUED",
+            request_id=request_id,
+            logs_url=logs_url,
+            created_at=job['created_at']
         )
         
-    except FileNotFoundError as e:
-        logger.warning(f"File not found for minting: {e}")
-        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        logger.error(f"Error minting tokens: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to mint tokens: {str(e)}")
+        logger.error(f"Failed to create download job: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
-
-@app.get("/files", response_model=ListFilesResponse)
-@limiter.limit("30/minute")
-def list_files(
-    request: Request,
-    _: bool = Depends(verify_api_key)
-):
-    """
-    List available files that can have additional tokens minted.
-    Requires API key if configured.
-    """
-    files = []
+@app.get("/downloads/{request_id}", response_model=DownloadResponse)
+async def get_download_status(request_id: str):
+    """Get download job status."""
     
-    for file_id, file_info in FILE_REGISTRY.items():
-        if os.path.exists(file_info["path"]):
-            files.append(FileInfo(
-                file_id=file_id,
-                filename=os.path.basename(file_info["path"]),
-                size=file_info["size"],
-                active_tokens=len(file_info["tokens"]),
-                created_at=datetime.fromtimestamp(file_info["created_at"]).isoformat()
-            ))
+    job = get_job(request_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
     
-    return ListFilesResponse(
-        files=files,
-        total_files=len(files)
+    # Build logs URL
+    logs_url = None
+    if PUBLIC_BASE_URL:
+        logs_url = f"{PUBLIC_BASE_URL}/downloads/{request_id}/logs"
+    
+    return DownloadResponse(
+        status=job['status'],
+        request_id=request_id,
+        object_url=job.get('object_url'),
+        bytes=job.get('bytes'),
+        duration_sec=job.get('duration_sec'),
+        logs_url=logs_url,
+        error=job.get('error'),
+        created_at=job.get('created_at'),
+        completed_at=job.get('completed_at')
     )
 
-
-@app.get("/once/{token}")
-@limiter.limit("30/minute")
-def serve_single_use(
-    request: Request, 
-    token: str, 
-    range_header: Optional[str] = Header(default=None, alias="Range"),
-    sig: Optional[str] = Query(None, description="Signature for signed links"),
-    exp: Optional[int] = Query(None, description="Expiry timestamp for signed links")
-):
-    """
-    Streams the file ONCE (supports Range) with optional signature verification.
-    After all concurrent streams finish, the file is deleted and the token is invalidated.
-    """
-    logger.info(f"Serving single-use file with token: {token}")
-
-    # Signature verification for signed links
-    if SIGNED_LINKS_ENABLED:
-        if not sig or not exp:
-            raise HTTPException(status_code=400, detail="Missing signature or expiry for signed link")
-        
-        # Check expiry
-        if time.time() > exp:
-            raise HTTPException(status_code=410, detail="Signed link expired")
-        
-        # Verify signature
-        if not _verify_signature(token, exp, sig):
-            raise HTTPException(status_code=403, detail="Invalid signature")
-
-    meta = ONCE_TOKENS.get(token)
-    if not meta:
-        raise HTTPException(status_code=404, detail="Expired or invalid link")
-
-    path = meta["path"]
-    if not os.path.exists(path):
-        ONCE_TOKENS.pop(token, None)
-        raise HTTPException(status_code=404, detail="File not found")
-
-    size = meta["size"]
-    meta["last_seen"] = time.time()
-
-    # defaults
-    start, end = 0, size - 1
-    status_code = 200
-    headers = {
-        "Accept-Ranges": "bytes",
-        "Cache-Control": "no-store",
-        "Content-Disposition": f'inline; filename="{pathlib.Path(path).name}"',
-        "Content-Type": "video/mp4",
-    }
-
-    # Range parsing
-    if range_header and size > 0:
-        try:
-            _, rng = range_header.split("=")
-            s, e = rng.split("-")
-            start = int(s) if s else 0
-            end = int(e) if e else (size - 1)
-            if end >= size:
-                end = size - 1
-            if start > end or start >= size:
-                raise ValueError
-            headers["Content-Range"] = f"bytes {start}-{end}/{size}"
-            headers["Content-Length"] = str(end - start + 1)
-            status_code = 206
-        except Exception:
-            start, end = 0, size - 1
-            headers["Content-Length"] = str(size)
-            status_code = 200
-    else:
-        headers["Content-Length"] = str(size)
-
-    meta["active"] += 1
-
-    def file_iter():
-        emitted_any = False
-        try:
-            with open(path, "rb") as f:
-                f.seek(start)
-                remaining = end - start + 1
-                chunk = 1024 * 1024  # 1 MiB
-                while remaining > 0:
-                    data = f.read(min(chunk, remaining))
-                    if not data:
-                        break
-                    emitted_any = True
-                    yield data
-                    remaining -= len(data)
-        finally:
-            meta["active"] -= 1
-            if emitted_any:
-                meta["consumed"] = True
-            if DELETE_AFTER_SERVE:
-                _maybe_delete_and_purge(token)
-            logger.info(f"File streaming completed for token: {token}")
-
-    return StreamingResponse(file_iter(), status_code=status_code, headers=headers)
-
-
-@app.get("/discover")
-@limiter.limit("20/minute")
-async def discover(
-    request: Request,
-    sources: str = Query(..., description="Comma-separated URLs", max_length=4096),
-    format: str = Query("csv", description="Output format: csv, json, or ndjson"),
-    limit: int = Query(100, ge=1, le=1000, description="Limit per source (1-1000)"),
-    min_views: Optional[int] = Query(None, ge=0, le=1_000_000_000, description="Minimum view count"),
-    min_duration: Optional[int] = Query(None, ge=1, le=86400, description="Minimum duration in seconds (1-86400)"),
-    max_duration: Optional[int] = Query(None, ge=1, le=86400, description="Maximum duration in seconds (1-86400)"),
-    dateafter: Optional[str] = Query(None, max_length=32, description="Date filter: YYYYMMDD or now-<days>days"),
-    match_filter: Optional[str] = Query(None, max_length=512, description="Raw yt-dlp match filter expression"),
-    fields: Optional[str] = Query(None, max_length=512, description="CSV field list"),
-    filename_hint: Optional[str] = Query(None, description="Ignored, for symmetry"),
-    _: bool = Depends(verify_api_key),
-):
-    """Discover metadata from one or more video sources without downloading (stricter validation)."""
-
-    # Enhanced source validation
-    source_urls = [url.strip() for url in sources.split(",") if url.strip()]
-    if not source_urls:
-        raise HTTPException(status_code=400, detail="No valid sources provided")
+@app.get("/downloads/{request_id}/logs")
+async def get_download_logs(request_id: str):
+    """Get download job logs."""
     
-    if len(source_urls) > 10:
-        raise HTTPException(status_code=400, detail="Too many sources (max 10)")
+    job = get_job(request_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
     
-    # Validate each URL
-    for i, url in enumerate(source_urls):
-        if len(url) > 2048:
-            raise HTTPException(status_code=400, detail=f"URL {i+1} too long (max 2048 characters)")
-        if not (url.startswith('http://') or url.startswith('https://')):
-            raise HTTPException(status_code=400, detail=f"URL {i+1} must start with http:// or https://")
-
-    # Stricter format validation
-    valid_formats = {"csv", "json", "ndjson"}
-    if format not in valid_formats:
-        raise HTTPException(status_code=400, detail=f"Invalid format. Must be one of: {', '.join(valid_formats)}")
-
-    # Duration validation logic
-    if min_duration is not None and max_duration is not None:
-        if min_duration >= max_duration:
-            raise HTTPException(status_code=400, detail="min_duration must be less than max_duration")
-
-    # Rate limiting based on complexity
-    complexity_score = len(source_urls) * (limit / 100)
-    if complexity_score > 50:  # Arbitrary complexity threshold
-        raise HTTPException(status_code=429, detail="Request too complex, reduce sources or limit")
-
-    logger.info(f"Discover request: {len(source_urls)} sources, format={format}, limit={limit} (complexity: {complexity_score:.1f})")
-
-    all_videos = []
-    seen_ids = set()
-
-    # Parse dateafter
-    parsed_dateafter = _parse_dateafter(dateafter)
-
-    # Synthesize match filter
-    combined_match_filter = _synthesize_match_filter(match_filter, min_duration, max_duration)
-
-    # Process each source
-    for source_url in source_urls:
+    # Return in-memory logs with option to read from file
+    logs = job.get('logs', [])
+    
+    # Try to read from persistent log file if available
+    log_file = LOG_DIR / f"{request_id}.log"
+    if log_file.exists():
         try:
-            # Build yt-dlp command
-            cmd = [
-                "yt-dlp",
-                "--skip-download",
-                "--dump-json",
-                "--ignore-errors",
-                "--no-warnings",
-                "--force-ipv4",
-                "--socket-timeout",
-                "30",
-                "--retries",
-                "10",
-                "--fragment-retries",
-                "50",
-                "--concurrent-fragments",
-                "10",
-                "--user-agent",
-                "Mozilla/5.0",
-                "--playlist-end",
-                str(limit),
-            ]
-
-            # Add optional filters
-            if parsed_dateafter:
-                cmd.extend(["--dateafter", parsed_dateafter])
-
-            if min_views is not None:
-                cmd.extend(["--min-views", str(min_views)])
-
-            if combined_match_filter:
-                cmd.extend(["--match-filter", combined_match_filter])
-
-            cmd.append(source_url)
-
-            logger.info(f"Running yt-dlp for source: {source_url}")
-
-            # Execute command
-            rc, stdout, stderr = await run(cmd, timeout=DOWNLOAD_TIMEOUT)
-
-            # Log warnings for non-zero return codes (but continue processing)
-            if rc not in (0, 1):
-                logger.warning(f"yt-dlp returned rc={rc} for source {source_url}: {stderr}")
-
-            # Parse JSON lines from stdout
-            for line in stdout.strip().split("\n"):
-                if not line.strip():
-                    continue
-
-                try:
-                    obj = json.loads(line)
-
-                    # Skip playlist objects, only process actual videos
-                    if obj.get("_type") in ("playlist", "multi_video"):
-                        continue
-
-                    # Normalize URL field
-                    obj["url"] = obj.get("webpage_url") or obj.get("url") or ""
-
-                    # De-duplicate by ID
-                    video_id = obj.get("id")
-                    if video_id and video_id not in seen_ids:
-                        seen_ids.add(video_id)
-                        all_videos.append(obj)
-
-                except (json.JSONDecodeError, KeyError) as e:
-                    logger.warning(f"Failed to parse JSON line: {e}")
-                    continue
-
+            with open(log_file, 'r', encoding='utf-8') as f:
+                file_logs = f.read().strip().split('\n') if f.read().strip() else []
+            # Return file logs if more comprehensive than memory logs
+            if len(file_logs) > len(logs):
+                logs = file_logs
         except Exception as e:
-            logger.warning(f"Error processing source {source_url}: {e}")
-            continue
+            logger.error(f"Failed to read log file {log_file}: {e}")
+    
+    return {
+        'request_id': request_id,
+        'logs': logs,
+        'status': job['status'],
+        'log_count': len(logs)
+    }
 
-    # Sort by upload_date (newest first)
-    def get_upload_date(video):
-        upload_date = video.get("upload_date")
-        if upload_date:
-            try:
-                return datetime.strptime(str(upload_date), "%Y%m%d")
-            except ValueError:
-                pass
-        return datetime.min
-
-    all_videos.sort(key=get_upload_date, reverse=True)
-
-    logger.info(f"Discover completed: {len(all_videos)} unique videos found")
-
-    # Format output
-    if format == "csv":
-        csv_data = _rows_to_csv(all_videos, fields)
-        return Response(content=csv_data, media_type="text/csv")
-    elif format == "json":
-        return Response(content=json.dumps(all_videos, indent=2), media_type="application/json")
-    elif format == "ndjson":
-        ndjson_lines = [json.dumps(video) for video in all_videos]
-        ndjson_content = "\n".join(ndjson_lines)
-        return Response(content=ndjson_content, media_type="application/x-ndjson")
-
-
-# =========================
-# Worker
-# =========================
-async def worker_job(req: DownloadReq, expected_name: str, dest: str):
-    """Enhanced worker job with logging"""
-    started_iso = datetime.utcnow().isoformat()
-    work_dir = tempfile.mkdtemp(prefix="dl_")
-    temp_tpl = os.path.join(work_dir, f"{req.tag}.%(ext)s")
-    out_local = os.path.join(work_dir, expected_name)
-
-    logger.info(f"Starting download job {req.tag}: {req.url}")
-
+@app.get("/healthz", response_model=HealthResponse)
+async def healthcheck():
+    """Health check endpoint."""
+    
+    checks = {
+        "executor": "healthy" if executor and not executor._shutdown else "unhealthy",
+        "rclone": "unknown",
+        "yt_dlp": "unknown"
+    }
+    
+    # Check rclone availability
     try:
-        job_set(req.tag, status="downloading", dest=dest)
-
-        # ---------- Hardened yt-dlp with fallbacks ----------
-        sock_to = int(req.socket_timeout or 30)
-        overall_to = int(req.timeout or DOWNLOAD_TIMEOUT)
-
-        def build_quality_flags(mode: str) -> List[str]:
-            if mode == "BEST_ORIGINAL":
-                return ["-f", "bestvideo*+bestaudio/best", "--merge-output-format", "mp4"]
-            if mode == "BEST_MP4":
-                return ["-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b", "--remux-video", "mp4"]
-            return ["-f", "bv*+ba/best", "--recode-video", "mp4"]  # STRICT_MP4_REENC
-
-        common = [
-            "yt-dlp",
-            "--no-warnings",
-            "--ignore-errors",
-            "--force-ipv4",
-            "--socket-timeout",
-            str(sock_to),
-            "--retries",
-            "10",
-            "--fragment-retries",
-            "50",
-            "--concurrent-fragments",
-            "10",
-            "-o",
-            temp_tpl,
-            req.url,
-        ]
-        common_ua = common + [
-            "--user-agent",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-        ]
-        qual_flags = build_quality_flags(req.quality)
-
-        strategies: List[List[str]] = []
-        if bool(req.prefer_api):
-            strategies.append(common_ua + ["--extractor-args", "rumble:use_api=1"] + qual_flags)
-        strategies.append(common_ua + qual_flags)
-        if req.quality != "STRICT_MP4_REENC":
-            strategies.append(common_ua + build_quality_flags("STRICT_MP4_REENC"))
-
-        attempts = int(req.retries or 3)
-        last_rc, last_se = None, ""
-        success = False
-
-        logger.info(
-            f"Job {req.tag}: Trying {len(strategies)} strategies with {attempts} attempts each"
+        process = await asyncio.create_subprocess_exec(
+            'rclone', 'version',
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL
         )
-
-        for strat_idx, strat_cmd in enumerate(strategies):
-            logger.info(f"Job {req.tag}: Strategy {strat_idx + 1}/{len(strategies)}")
-            for attempt in range(1, attempts + 1):
-                logger.info(f"Job {req.tag}: Attempt {attempt}/{attempts}")
-                rc, so, se = await run(strat_cmd, timeout=overall_to)
-                if rc == 0:
-                    success = True
-                    logger.info(
-                        f"Job {req.tag}: Download successful on strategy {strat_idx + 1}, attempt {attempt}"
-                    )
-                    break
-                last_rc, last_se = rc, se
-                logger.warning(f"Job {req.tag}: Attempt {attempt} failed with rc={rc}")
-                await asyncio.sleep(4 * attempt)  # 4s, 8s, 12s...
-            if success:
-                break
-
-        if not success:
-            err = f"yt-dlp failed (last rc={last_rc})\n{(last_se or '')[-1500:]}"
-            logger.error(f"Job {req.tag}: {err}")
-            job_set(req.tag, status="error", payload={"error_message": err})
-            await safe_callback(
-                req.callback_url or "",
-                {
-                    "status": "error",
-                    "tag": req.tag,
-                    "error_message": err,
-                    "started_at": started_iso,
-                    "completed_at": datetime.utcnow().isoformat(),
-                },
-            )
-            return
-
-        # ---------- Pick newest finished media ----------
-        files = [
-            f
-            for f in os.listdir(work_dir)
-            if os.path.isfile(os.path.join(work_dir, f)) and not f.endswith(".part")
-        ]
-        files = [f for f in files if re.search(r"\.(mp4|mkv|webm|m4a|mov|mp3)$", f, re.I)]
-        if not files:
-            err = "no media file produced"
-            logger.error(f"Job {req.tag}: {err}")
-            job_set(req.tag, status="error", payload={"error_message": err})
-            await safe_callback(
-                req.callback_url or "",
-                {
-                    "status": "error",
-                    "tag": req.tag,
-                    "error_message": err,
-                    "started_at": started_iso,
-                    "completed_at": datetime.utcnow().isoformat(),
-                },
-            )
-            return
-
-        files.sort(key=lambda f: os.path.getmtime(os.path.join(work_dir, f)), reverse=True)
-        src = os.path.join(work_dir, files[0])
-        logger.info(f"Job {req.tag}: Selected file: {files[0]}")
-
-        # ---------- Normalize to mp4 if needed ----------
-        if not src.lower().endswith(".mp4") and expected_name.lower().endswith(".mp4"):
-            logger.info(f"Job {req.tag}: Converting to mp4")
-            rc2, _, _ = await run(["ffmpeg", "-y", "-i", src, "-c", "copy", out_local], timeout=600)
-            if rc2 != 0:
-                logger.warning(f"Job {req.tag}: Copy failed, trying re-encode")
-                rc3, _, _ = await run(
-                    [
-                        "ffmpeg",
-                        "-y",
-                        "-i",
-                        src,
-                        "-c:v",
-                        "libx264",
-                        "-c:a",
-                        "aac",
-                        "-movflags",
-                        "+faststart",
-                        out_local,
-                    ],
-                    timeout=max(1800, overall_to),
-                )
-                if rc3 != 0:
-                    err = "ffmpeg failed"
-                    logger.error(f"Job {req.tag}: {err}")
-                    job_set(req.tag, status="error", payload={"error_message": err})
-                    await safe_callback(
-                        req.callback_url or "",
-                        {
-                            "status": "error",
-                            "tag": req.tag,
-                            "error_message": err,
-                            "started_at": started_iso,
-                            "completed_at": datetime.utcnow().isoformat(),
-                        },
-                    )
-                    return
-        else:
-            shutil.move(src, out_local)
-
-        # ---------- Deliver ----------
-        if dest == "DRIVE":
-            logger.info(f"Job {req.tag}: Uploading to Google Drive")
-            try:
-                folder_id = req.drive_folder or DRIVE_FOLDER_ID_DEFAULT
-                if not folder_id:
-                    raise RuntimeError("DRIVE_FOLDER_ID missing")
-                up = drive_upload(out_local, expected_name, folder_id)
-                payload = {
-                    "tag": req.tag,
-                    "expected_name": expected_name,
-                    "drive_file_id": up["file_id"],
-                    "drive_link": up.get("webViewLink"),
-                    "quality": req.quality,
-                    "dest": "DRIVE",
-                }
-                job_set(req.tag, status="ready", payload=payload)
-                logger.info(f"Job {req.tag}: Successfully uploaded to Drive: {up['file_id']}")
-                await safe_callback(
-                    req.callback_url or "",
-                    {
-                        "status": "ready",
-                        **payload,
-                        "started_at": started_iso,
-                        "completed_at": datetime.utcnow().isoformat(),
-                    },
-                )
-            finally:
-                try:
-                    os.remove(out_local)
-                except Exception:
-                    pass
-        else:
-            logger.info(f"Job {req.tag}: Saving to local storage")
-            
-            artifacts = []
-            
-            # Check if we should try to extract separate audio/video
-            if req.separate_audio_video and dest == "LOCAL":
-                logger.info(f"Job {req.tag}: Attempting to extract separate audio/video")
-                
-                # Try to extract audio
-                audio_name = expected_name.replace(".mp4", f"_audio.{req.audio_format}")
-                audio_path = os.path.join(work_dir, audio_name)
-                
-                # Extract audio using ffmpeg
-                audio_cmd = [
-                    "ffmpeg", "-y", "-i", out_local, 
-                    "-vn", "-acodec", "copy" if req.audio_format == "m4a" else "mp3",
-                    audio_path
-                ]
-                
-                rc_audio, _, _ = await run(audio_cmd, timeout=300)
-                
-                if rc_audio == 0 and os.path.exists(audio_path):
-                    # Move audio to public directory
-                    public_audio_path = os.path.join(PUBLIC_FILES_DIR, audio_name)
-                    shutil.move(audio_path, public_audio_path)
-                    
-                    # Create tokens for audio
-                    audio_urls = make_multiple_use_urls(
-                        audio_name, 
-                        tag=f"{req.tag}_audio", 
-                        count=req.token_count or 1,
-                        ttl_sec=req.custom_ttl
-                    )
-                    
-                    artifacts.append({
-                        "type": "audio",
-                        "filename": audio_name,
-                        "urls": audio_urls,
-                        "format": req.audio_format
-                    })
-                    logger.info(f"Job {req.tag}: Audio extracted to {audio_name}")
-                
-                # Video file (remove audio if we successfully extracted it)
-                video_name = expected_name.replace(".mp4", "_video.mp4")
-                video_path = os.path.join(work_dir, video_name)
-                
-                if rc_audio == 0:
-                    # Create video-only version
-                    video_cmd = [
-                        "ffmpeg", "-y", "-i", out_local,
-                        "-an", "-vcodec", "copy",
-                        video_path
-                    ]
-                    
-                    rc_video, _, _ = await run(video_cmd, timeout=300)
-                    
-                    if rc_video == 0 and os.path.exists(video_path):
-                        # Move video to public directory
-                        public_video_path = os.path.join(PUBLIC_FILES_DIR, video_name)
-                        shutil.move(video_path, public_video_path)
-                        
-                        # Create tokens for video
-                        video_urls = make_multiple_use_urls(
-                            video_name,
-                            tag=f"{req.tag}_video",
-                            count=req.token_count or 1,
-                            ttl_sec=req.custom_ttl
-                        )
-                        
-                        artifacts.append({
-                            "type": "video",
-                            "filename": video_name,
-                            "urls": video_urls,
-                            "format": "mp4"
-                        })
-                        logger.info(f"Job {req.tag}: Video extracted to {video_name}")
-                        
-                        # Remove original combined file
-                        try:
-                            os.remove(out_local)
-                        except Exception:
-                            pass
-                    else:
-                        # Video extraction failed, fall back to combined file
-                        logger.warning(f"Job {req.tag}: Video extraction failed, using combined file")
-                        req.separate_audio_video = False
-            
-            # If not separating or if separation failed, handle as single file
-            if not req.separate_audio_video or not artifacts:
-                public_path = os.path.join(PUBLIC_FILES_DIR, expected_name)
-                shutil.move(out_local, public_path)
-                
-                # Create multiple tokens if requested
-                once_urls = make_multiple_use_urls(
-                    expected_name,
-                    tag=req.tag,
-                    count=req.token_count or 1,
-                    ttl_sec=req.custom_ttl
-                )
-                
-                artifacts.append({
-                    "type": "combined",
-                    "filename": expected_name,
-                    "urls": once_urls,
-                    "format": "mp4"
-                })
-            
-            # Prepare response payload
-            effective_ttl = req.custom_ttl if req.custom_ttl is not None else ONCE_TOKEN_TTL_SEC
-            
-            if len(artifacts) == 1 and artifacts[0]["type"] == "combined":
-                # Legacy single-file response format for backward compatibility
-                payload = {
-                    "tag": req.tag,
-                    "expected_name": expected_name,
-                    "once_url": artifacts[0]["urls"][0],  # First URL for backward compatibility
-                    "once_urls": artifacts[0]["urls"],  # All URLs
-                    "expires_in_sec": effective_ttl,
-                    "quality": req.quality,
-                    "dest": "LOCAL",
-                }
-            else:
-                # Multi-artifact response format
-                payload = {
-                    "tag": req.tag,
-                    "expected_name": expected_name,
-                    "artifacts": artifacts,
-                    "expires_in_sec": effective_ttl,
-                    "quality": req.quality,
-                    "dest": "LOCAL",
-                    "separate_audio_video": req.separate_audio_video,
-                }
-            
-            job_set(req.tag, status="ready", payload=payload)
-            
-            if len(artifacts) == 1:
-                logger.info(f"Job {req.tag}: File ready with {len(artifacts[0]['urls'])} URLs")
-            else:
-                logger.info(f"Job {req.tag}: {len(artifacts)} artifacts ready")
-            
-            await safe_callback(
-                req.callback_url or "",
-                {
-                    "status": "ready",
-                    **payload,
-                    "started_at": started_iso,
-                    "completed_at": datetime.utcnow().isoformat(),
-                },
-            )
-
-    except Exception as e:
-        err = str(e)
-        logger.error(f"Job {req.tag}: Unexpected error: {err}")
-        job_set(req.tag, status="error", payload={"error_message": err})
-        await safe_callback(
-            req.callback_url or "",
-            {
-                "status": "error",
-                "tag": req.tag,
-                "error_message": err,
-                "started_at": started_iso,
-                "completed_at": datetime.utcnow().isoformat(),
-            },
+        await asyncio.wait_for(process.communicate(), timeout=5)
+        checks["rclone"] = "healthy" if process.returncode == 0 else "unhealthy"
+    except Exception:
+        checks["rclone"] = "unhealthy"
+    
+    # Check yt-dlp availability
+    try:
+        process = await asyncio.create_subprocess_exec(
+            'yt-dlp', '--version',
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL
         )
-    finally:
-        try:
-            shutil.rmtree(work_dir, ignore_errors=True)
-        except Exception:
-            pass
+        await asyncio.wait_for(process.communicate(), timeout=5)
+        checks["yt_dlp"] = "healthy" if process.returncode == 0 else "unhealthy"
+    except Exception:
+        checks["yt_dlp"] = "unhealthy"
+    
+    # Determine overall status
+    overall_status = "healthy" if all(
+        check in ["healthy", "unknown"] for check in checks.values()
+    ) else "unhealthy"
+    
+    status_code = 200 if overall_status == "healthy" else 503
+    
+    response = HealthResponse(
+        status=overall_status,
+        version="2.0.0",
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        checks=checks
+    )
+    
+    return JSONResponse(content=response.model_dump(), status_code=status_code)
 
+@app.get("/readyz")
+async def readiness():
+    """Readiness check endpoint."""
+    
+    if not executor or executor._shutdown or shutdown_event.is_set():
+        return JSONResponse(
+            {"status": "not ready", "reason": "service shutting down"},
+            status_code=503
+        )
+    
+    return {"status": "ready", "timestamp": datetime.now(timezone.utc).isoformat()}
+
+@app.get("/version")
+async def version():
+    """Version endpoint."""
+    return {
+        "version": "2.0.0",
+        "build_date": "2025-09-24",
+        "features": ["streaming", "rclone", "yt-dlp"]
+    }
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics endpoint."""
+    from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+    
+    return Response(
+        content=generate_latest(),
+        media_type=CONTENT_TYPE_LATEST
+    )
 
 # =========================
-# Main
+# Error Handlers
 # =========================
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Handle HTTP exceptions with consistent JSON format."""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": exc.detail,
+            "status_code": exc.status_code,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+    )
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    """Handle unexpected exceptions."""
+    logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "Internal server error",
+            "status_code": 500,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+    )
+
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=APP_PORT, reload=False)
+    port = int(os.getenv("PORT", "8080"))
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)

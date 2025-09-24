@@ -1,0 +1,34 @@
+version: '3.8'
+
+services:
+  yt-dlp-service:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - API_KEY=your-secret-api-key-here
+      - ALLOW_YT_DOWNLOADS=false
+      - RCLONE_REMOTE_DEFAULT=minio
+      - PUBLIC_BASE_URL=http://localhost:8080
+      - WORKERS=2
+      - LOG_LEVEL=INFO
+    volumes:
+      - ~/.config/rclone:/home/appuser/.config/rclone:ro
+      - ./logs:/var/log/app
+    restart: unless-stopped
+    
+  # Example MinIO for testing
+  minio:
+    image: minio/minio:latest
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+
+volumes:
+  minio_data:
