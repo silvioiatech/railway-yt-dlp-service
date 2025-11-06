@@ -34,10 +34,10 @@ USER appuser
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8080/healthz || exit 1
+    CMD curl -fsS http://127.0.0.1:8080/api/v1/health || exit 1
 
 # Use tini as entrypoint
 ENTRYPOINT ["tini", "--"]
 
-# Default command
-CMD ["python", "app.py"]
+# Default command - use uvicorn to run FastAPI
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]

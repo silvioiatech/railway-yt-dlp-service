@@ -19,7 +19,7 @@ class Settings(BaseSettings):
 
     # Core Settings
     APP_NAME: str = "Ultimate Media Downloader"
-    VERSION: str = "3.0.0"
+    VERSION: str = "3.1.0"
     DEBUG: bool = Field(default=False, description="Enable debug mode")
     LOG_LEVEL: str = Field(default="INFO", description="Logging level")
 
