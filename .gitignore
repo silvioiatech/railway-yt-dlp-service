@@ -29,3 +29,24 @@ Thumbs.db
 # Testing
 coverage.xml
 .tox/
+
+# Test coverage
+tests/coverage/.coverage
+tests/coverage/htmlcov/
+*.coverage
+.coverage.*
+
+# Test artifacts
+tests/__pycache__/
+tests/**/__pycache__/
+.pytest_cache/
+
+# Logs
+logs/
+*.log
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+

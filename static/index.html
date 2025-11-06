@@ -1,0 +1,819 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="theme-color" content="#6366f1">
+    <meta name="description" content="Ultimate Media Downloader - Download videos, playlists, and audio from 1000+ platforms">
+
+    <title>Ultimate Media Downloader</title>
+
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        primary: {
+                            50: '#eef2ff',
+                            100: '#e0e7ff',
+                            500: '#6366f1',
+                            600: '#4f46e5',
+                            700: '#4338ca',
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+
+    <!-- Alpine.js for reactivity -->
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+
+    <!-- PWA Manifest -->
+    <link rel="manifest" href="/static/manifest.json">
+
+    <!-- Favicon -->
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+
+    <!-- Custom Styles -->
+    <style>
+        /* Smooth transitions */
+        * {
+            transition: background-color 0.2s, border-color 0.2s, color 0.2s;
+        }
+
+        /* Custom scrollbar */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: rgb(209 213 219);
+            border-radius: 4px;
+        }
+
+        .dark ::-webkit-scrollbar-thumb {
+            background: rgb(75 85 99);
+        }
+
+        /* Animations */
+        @keyframes slideUp {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        @keyframes pulse {
+            0%, 100% {
+                opacity: 1;
+            }
+            50% {
+                opacity: 0.5;
+            }
+        }
+
+        .animate-slide-up {
+            animation: slideUp 0.3s ease-out;
+        }
+
+        .animate-pulse-slow {
+            animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+        }
+
+        /* Progress bar */
+        @keyframes progress {
+            0% {
+                background-position: 0 0;
+            }
+            100% {
+                background-position: 40px 0;
+            }
+        }
+
+        .progress-animated {
+            background: linear-gradient(
+                45deg,
+                transparent 25%,
+                rgba(255, 255, 255, 0.2) 25%,
+                rgba(255, 255, 255, 0.2) 50%,
+                transparent 50%,
+                transparent 75%,
+                rgba(255, 255, 255, 0.2) 75%,
+                rgba(255, 255, 255, 0.2)
+            );
+            background-size: 40px 40px;
+            animation: progress 1s linear infinite;
+        }
+
+        /* Glass morphism */
+        .glass {
+            background: rgba(255, 255, 255, 0.7);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+        }
+
+        .dark .glass {
+            background: rgba(17, 24, 39, 0.7);
+        }
+
+        /* Gradient text */
+        .gradient-text {
+            background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 50%, #ec4899 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        /* Button hover effects */
+        .btn-primary {
+            position: relative;
+            overflow: hidden;
+        }
+
+        .btn-primary::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
+            transition: left 0.5s;
+        }
+
+        .btn-primary:hover::before {
+            left: 100%;
+        }
+    </style>
+</head>
+<body class="h-full bg-gradient-to-br from-indigo-50 via-white to-purple-50 dark:from-gray-900 dark:via-gray-800 dark:to-gray-900" x-data="app()" x-cloak>
+
+    <!-- Main Container -->
+    <div class="min-h-full flex flex-col">
+
+        <!-- Header -->
+        <header class="sticky top-0 z-50 glass border-b border-gray-200 dark:border-gray-700">
+            <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                <div class="flex items-center justify-between h-16">
+                    <!-- Logo -->
+                    <div class="flex items-center space-x-3">
+                        <div class="text-3xl">⚡</div>
+                        <div>
+                            <h1 class="text-xl font-bold gradient-text">Ultimate Downloader</h1>
+                            <p class="text-xs text-gray-500 dark:text-gray-400">1000+ platforms supported</p>
+                        </div>
+                    </div>
+
+                    <!-- Actions -->
+                    <div class="flex items-center space-x-3">
+                        <!-- Dark Mode Toggle -->
+                        <button
+                            @click="toggleDarkMode()"
+                            class="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors"
+                            title="Toggle dark mode"
+                        >
+                            <svg x-show="!darkMode" class="w-5 h-5 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"></path>
+                            </svg>
+                            <svg x-show="darkMode" class="w-5 h-5 text-yellow-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z"></path>
+                            </svg>
+                        </button>
+
+                        <!-- Menu Button (Mobile) -->
+                        <button
+                            @click="showMenu = !showMenu"
+                            class="sm:hidden p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700"
+                        >
+                            <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"></path>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8">
+
+            <!-- Hero Section -->
+            <div class="text-center mb-12 animate-slide-up">
+                <h2 class="text-4xl sm:text-5xl font-bold text-gray-900 dark:text-white mb-4">
+                    Download Anything,<br>
+                    <span class="gradient-text">Anywhere</span>
+                </h2>
+                <p class="text-lg text-gray-600 dark:text-gray-300 max-w-2xl mx-auto">
+                    Videos, playlists, audio, and subtitles from YouTube, Vimeo, Twitter, and 1000+ more platforms
+                </p>
+            </div>
+
+            <!-- Main Download Form -->
+            <div class="max-w-3xl mx-auto mb-12">
+                <div class="bg-white dark:bg-gray-800 rounded-2xl shadow-2xl p-6 sm:p-8 border border-gray-100 dark:border-gray-700">
+
+                    <!-- URL Input -->
+                    <div class="mb-6">
+                        <label for="url-input" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                            Paste video or playlist URL
+                        </label>
+                        <div class="relative">
+                            <input
+                                id="url-input"
+                                type="text"
+                                x-model="url"
+                                @paste="handlePaste($event)"
+                                @input="urlChanged()"
+                                placeholder="https://youtube.com/watch?v=..."
+                                class="w-full px-4 py-4 pr-12 text-lg rounded-xl border-2 border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 text-gray-900 dark:text-white placeholder-gray-400 focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/20 outline-none transition-all"
+                            >
+                            <button
+                                x-show="url.length > 0"
+                                @click="url = ''; urlInfo = null"
+                                class="absolute right-3 top-1/2 -translate-y-1/2 p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg"
+                            >
+                                <svg class="w-5 h-5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+                                </svg>
+                            </button>
+                        </div>
+
+                        <!-- URL Info Badge -->
+                        <div x-show="urlInfo" class="mt-3 flex items-center space-x-2 text-sm">
+                            <span x-show="urlInfo?.type === 'video'" class="inline-flex items-center px-3 py-1 rounded-full bg-blue-100 dark:bg-blue-900 text-blue-700 dark:text-blue-300">
+                                <svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"></path>
+                                </svg>
+                                Single Video
+                            </span>
+                            <span x-show="urlInfo?.type === 'playlist'" class="inline-flex items-center px-3 py-1 rounded-full bg-purple-100 dark:bg-purple-900 text-purple-700 dark:text-purple-300">
+                                <svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path>
+                                </svg>
+                                Playlist (<span x-text="urlInfo?.videoCount"></span> videos)
+                            </span>
+                        </div>
+                    </div>
+
+                    <!-- Quick Actions -->
+                    <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-6">
+                        <button
+                            @click="startDownload('best')"
+                            :disabled="!url || downloading"
+                            class="btn-primary px-6 py-4 bg-gradient-to-r from-indigo-600 to-purple-600 text-white font-semibold rounded-xl hover:from-indigo-700 hover:to-purple-700 disabled:opacity-50 disabled:cursor-not-allowed shadow-lg hover:shadow-xl transform hover:-translate-y-0.5 transition-all"
+                        >
+                            <svg class="w-5 h-5 inline-block mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path>
+                            </svg>
+                            Download
+                        </button>
+
+                        <button
+                            @click="getInfo()"
+                            :disabled="!url"
+                            class="px-6 py-4 bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-200 font-semibold rounded-xl border-2 border-gray-300 dark:border-gray-600 hover:border-indigo-500 dark:hover:border-indigo-500 hover:bg-gray-50 dark:hover:bg-gray-600 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+                        >
+                            <svg class="w-5 h-5 inline-block mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                            </svg>
+                            Get Info
+                        </button>
+
+                        <button
+                            @click="showAdvanced = !showAdvanced"
+                            :disabled="!url"
+                            class="px-6 py-4 bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-200 font-semibold rounded-xl border-2 border-gray-300 dark:border-gray-600 hover:border-indigo-500 dark:hover:border-indigo-500 hover:bg-gray-50 dark:hover:bg-gray-600 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+                            :class="{ 'border-indigo-500 bg-indigo-50 dark:bg-gray-600': showAdvanced }"
+                        >
+                            <svg class="w-5 h-5 inline-block mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4"></path>
+                            </svg>
+                            Advanced
+                        </button>
+                    </div>
+
+                    <!-- Advanced Options Panel -->
+                    <div
+                        x-show="showAdvanced"
+                        x-transition:enter="transition ease-out duration-200"
+                        x-transition:enter-start="opacity-0 transform scale-95"
+                        x-transition:enter-end="opacity-100 transform scale-100"
+                        class="border-t border-gray-200 dark:border-gray-700 pt-6 mt-6"
+                    >
+                        <h3 class="text-lg font-semibold text-gray-900 dark:text-white mb-4">Advanced Options</h3>
+
+                        <!-- Quality Selection -->
+                        <div class="mb-6">
+                            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">
+                                Quality
+                            </label>
+                            <div class="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                                <template x-for="quality in ['best', '2160p', '1440p', '1080p', '720p', '480p', 'audio']" :key="quality">
+                                    <button
+                                        @click="selectedQuality = quality"
+                                        :class="selectedQuality === quality ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-200 border-gray-300 dark:border-gray-600 hover:border-indigo-500'"
+                                        class="px-4 py-3 rounded-lg border-2 font-medium transition-all"
+                                    >
+                                        <span x-text="quality === 'best' ? 'Best (Auto)' : quality === 'audio' ? 'Audio Only' : quality"></span>
+                                    </button>
+                                </template>
+                            </div>
+                        </div>
+
+                        <!-- Format Selection -->
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-6 mb-6">
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                                    Video Format
+                                </label>
+                                <select
+                                    x-model="videoFormat"
+                                    class="w-full px-4 py-3 rounded-lg border-2 border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/20 outline-none"
+                                >
+                                    <option value="mp4">MP4 (recommended)</option>
+                                    <option value="mkv">MKV</option>
+                                    <option value="webm">WebM</option>
+                                    <option value="avi">AVI</option>
+                                </select>
+                            </div>
+
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+                                    Audio Format
+                                </label>
+                                <select
+                                    x-model="audioFormat"
+                                    class="w-full px-4 py-3 rounded-lg border-2 border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/20 outline-none"
+                                >
+                                    <option value="m4a">M4A (recommended)</option>
+                                    <option value="mp3">MP3</option>
+                                    <option value="flac">FLAC</option>
+                                    <option value="opus">OPUS</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <!-- Extra Features -->
+                        <div class="space-y-3">
+                            <label class="flex items-center cursor-pointer">
+                                <input
+                                    type="checkbox"
+                                    x-model="downloadSubtitles"
+                                    class="w-5 h-5 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500 focus:ring-offset-0 cursor-pointer"
+                                >
+                                <span class="ml-3 text-sm font-medium text-gray-700 dark:text-gray-300">Download subtitles (if available)</span>
+                            </label>
+
+                            <label class="flex items-center cursor-pointer">
+                                <input
+                                    type="checkbox"
+                                    x-model="embedThumbnail"
+                                    class="w-5 h-5 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500 focus:ring-offset-0 cursor-pointer"
+                                >
+                                <span class="ml-3 text-sm font-medium text-gray-700 dark:text-gray-300">Embed thumbnail in file</span>
+                            </label>
+
+                            <label class="flex items-center cursor-pointer">
+                                <input
+                                    type="checkbox"
+                                    x-model="embedMetadata"
+                                    class="w-5 h-5 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500 focus:ring-offset-0 cursor-pointer"
+                                >
+                                <span class="ml-3 text-sm font-medium text-gray-700 dark:text-gray-300">Embed metadata (title, artist, etc.)</span>
+                            </label>
+                        </div>
+
+                        <!-- Download with Advanced Settings -->
+                        <div class="mt-6">
+                            <button
+                                @click="startDownload('custom')"
+                                :disabled="!url || downloading"
+                                class="w-full btn-primary px-6 py-4 bg-gradient-to-r from-indigo-600 to-purple-600 text-white font-semibold rounded-xl hover:from-indigo-700 hover:to-purple-700 disabled:opacity-50 disabled:cursor-not-allowed shadow-lg hover:shadow-xl transition-all"
+                            >
+                                Download with Custom Settings
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Download Progress -->
+            <div
+                x-show="downloading || downloads.length > 0"
+                class="max-w-3xl mx-auto mb-12"
+            >
+                <h3 class="text-xl font-bold text-gray-900 dark:text-white mb-4">
+                    <span x-show="downloading">Current Download</span>
+                    <span x-show="!downloading && downloads.length > 0">Recent Downloads</span>
+                </h3>
+
+                <div class="space-y-4">
+                    <template x-for="download in downloads" :key="download.id">
+                        <div class="bg-white dark:bg-gray-800 rounded-xl shadow-lg p-6 border border-gray-100 dark:border-gray-700 animate-slide-up">
+                            <!-- Download Header -->
+                            <div class="flex items-start justify-between mb-4">
+                                <div class="flex-1 min-w-0">
+                                    <h4 class="text-lg font-semibold text-gray-900 dark:text-white truncate" x-text="download.title || 'Downloading...'"></h4>
+                                    <p class="text-sm text-gray-500 dark:text-gray-400 truncate mt-1" x-text="download.url"></p>
+                                </div>
+                                <div class="ml-4 flex items-center space-x-2">
+                                    <!-- Status Badge -->
+                                    <span
+                                        class="px-3 py-1 rounded-full text-xs font-semibold"
+                                        :class="{
+                                            'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200': download.status === 'queued',
+                                            'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200': download.status === 'downloading',
+                                            'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200': download.status === 'completed',
+                                            'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200': download.status === 'failed'
+                                        }"
+                                        x-text="download.status"
+                                    ></span>
+                                </div>
+                            </div>
+
+                            <!-- Progress Bar -->
+                            <div x-show="download.status === 'downloading'" class="mb-4">
+                                <div class="flex items-center justify-between text-sm text-gray-600 dark:text-gray-400 mb-2">
+                                    <span x-text="download.progress + '%'"></span>
+                                    <span x-text="download.speed"></span>
+                                </div>
+                                <div class="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-3 overflow-hidden">
+                                    <div
+                                        class="h-full bg-gradient-to-r from-indigo-500 to-purple-500 progress-animated rounded-full transition-all duration-300"
+                                        :style="`width: ${download.progress}%`"
+                                    ></div>
+                                </div>
+                                <div class="flex items-center justify-between text-sm text-gray-500 dark:text-gray-400 mt-2">
+                                    <span x-text="download.downloaded + ' / ' + download.totalSize"></span>
+                                    <span x-text="'ETA: ' + download.eta"></span>
+                                </div>
+                            </div>
+
+                            <!-- Actions -->
+                            <div class="flex items-center space-x-3">
+                                <button
+                                    x-show="download.status === 'downloading'"
+                                    @click="pauseDownload(download.id)"
+                                    class="px-4 py-2 bg-yellow-100 hover:bg-yellow-200 dark:bg-yellow-900 dark:hover:bg-yellow-800 text-yellow-800 dark:text-yellow-200 rounded-lg font-medium transition-colors"
+                                >
+                                    <svg class="w-4 h-4 inline-block mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                                    </svg>
+                                    Pause
+                                </button>
+
+                                <button
+                                    x-show="download.status === 'completed'"
+                                    @click="openFile(download.fileUrl)"
+                                    class="px-4 py-2 bg-green-100 hover:bg-green-200 dark:bg-green-900 dark:hover:bg-green-800 text-green-800 dark:text-green-200 rounded-lg font-medium transition-colors"
+                                >
+                                    <svg class="w-4 h-4 inline-block mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path>
+                                    </svg>
+                                    Download File
+                                </button>
+
+                                <button
+                                    x-show="download.status === 'failed'"
+                                    @click="retryDownload(download.id)"
+                                    class="px-4 py-2 bg-red-100 hover:bg-red-200 dark:bg-red-900 dark:hover:bg-red-800 text-red-800 dark:text-red-200 rounded-lg font-medium transition-colors"
+                                >
+                                    <svg class="w-4 h-4 inline-block mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                                    </svg>
+                                    Retry
+                                </button>
+
+                                <button
+                                    @click="removeDownload(download.id)"
+                                    class="ml-auto px-4 py-2 text-gray-500 hover:text-red-600 dark:text-gray-400 dark:hover:text-red-400 rounded-lg transition-colors"
+                                >
+                                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path>
+                                    </svg>
+                                </button>
+                            </div>
+
+                            <!-- Error Message -->
+                            <div x-show="download.status === 'failed' && download.error" class="mt-4 p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg">
+                                <p class="text-sm text-red-800 dark:text-red-200" x-text="download.error"></p>
+                            </div>
+                        </div>
+                    </template>
+                </div>
+            </div>
+
+            <!-- Features Grid -->
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-12">
+                <div class="bg-white dark:bg-gray-800 rounded-xl p-6 shadow-lg border border-gray-100 dark:border-gray-700">
+                    <div class="w-12 h-12 bg-indigo-100 dark:bg-indigo-900 rounded-lg flex items-center justify-center mb-4">
+                        <svg class="w-6 h-6 text-indigo-600 dark:text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path>
+                        </svg>
+                    </div>
+                    <h3 class="text-lg font-semibold text-gray-900 dark:text-white mb-2">Lightning Fast</h3>
+                    <p class="text-gray-600 dark:text-gray-300">Download videos at maximum speed with our optimized infrastructure</p>
+                </div>
+
+                <div class="bg-white dark:bg-gray-800 rounded-xl p-6 shadow-lg border border-gray-100 dark:border-gray-700">
+                    <div class="w-12 h-12 bg-purple-100 dark:bg-purple-900 rounded-lg flex items-center justify-center mb-4">
+                        <svg class="w-6 h-6 text-purple-600 dark:text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path>
+                        </svg>
+                    </div>
+                    <h3 class="text-lg font-semibold text-gray-900 dark:text-white mb-2">100% Private</h3>
+                    <p class="text-gray-600 dark:text-gray-300">Your downloads are private and automatically deleted after 1 hour</p>
+                </div>
+
+                <div class="bg-white dark:bg-gray-800 rounded-xl p-6 shadow-lg border border-gray-100 dark:border-gray-700">
+                    <div class="w-12 h-12 bg-pink-100 dark:bg-pink-900 rounded-lg flex items-center justify-center mb-4">
+                        <svg class="w-6 h-6 text-pink-600 dark:text-pink-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9"></path>
+                        </svg>
+                    </div>
+                    <h3 class="text-lg font-semibold text-gray-900 dark:text-white mb-2">1000+ Platforms</h3>
+                    <p class="text-gray-600 dark:text-gray-300">YouTube, Vimeo, Twitter, TikTok, Instagram, and many more</p>
+                </div>
+            </div>
+
+            <!-- Info Card -->
+            <div
+                x-show="videoInfo"
+                class="max-w-3xl mx-auto bg-white dark:bg-gray-800 rounded-xl shadow-lg p-6 border border-gray-100 dark:border-gray-700 mb-12"
+            >
+                <div class="flex items-start justify-between mb-4">
+                    <h3 class="text-xl font-bold text-gray-900 dark:text-white">Video Information</h3>
+                    <button @click="videoInfo = null" class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-200">
+                        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+                        </svg>
+                    </button>
+                </div>
+
+                <div x-show="videoInfo" class="space-y-4">
+                    <div>
+                        <img :src="videoInfo?.thumbnail" class="w-full rounded-lg" alt="Video thumbnail">
+                    </div>
+                    <div>
+                        <h4 class="font-semibold text-gray-900 dark:text-white" x-text="videoInfo?.title"></h4>
+                        <p class="text-sm text-gray-600 dark:text-gray-400 mt-1" x-text="videoInfo?.uploader"></p>
+                    </div>
+                    <div class="grid grid-cols-3 gap-4 text-center">
+                        <div>
+                            <p class="text-2xl font-bold text-gray-900 dark:text-white" x-text="videoInfo?.views"></p>
+                            <p class="text-sm text-gray-600 dark:text-gray-400">Views</p>
+                        </div>
+                        <div>
+                            <p class="text-2xl font-bold text-gray-900 dark:text-white" x-text="videoInfo?.duration"></p>
+                            <p class="text-sm text-gray-600 dark:text-gray-400">Duration</p>
+                        </div>
+                        <div>
+                            <p class="text-2xl font-bold text-gray-900 dark:text-white" x-text="videoInfo?.fileSize"></p>
+                            <p class="text-sm text-gray-600 dark:text-gray-400">File Size</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        </main>
+
+        <!-- Footer -->
+        <footer class="bg-white dark:bg-gray-800 border-t border-gray-200 dark:border-gray-700 mt-12">
+            <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-8">
+                    <div>
+                        <h4 class="font-semibold text-gray-900 dark:text-white mb-3">About</h4>
+                        <p class="text-sm text-gray-600 dark:text-gray-400">
+                            Ultimate Media Downloader is a free tool powered by yt-dlp, supporting downloads from 1000+ platforms.
+                        </p>
+                    </div>
+                    <div>
+                        <h4 class="font-semibold text-gray-900 dark:text-white mb-3">Supported Platforms</h4>
+                        <ul class="text-sm text-gray-600 dark:text-gray-400 space-y-1">
+                            <li>YouTube, Vimeo, Dailymotion</li>
+                            <li>Twitter, TikTok, Instagram</li>
+                            <li>Facebook, Reddit, Twitch</li>
+                            <li>And 1000+ more...</li>
+                        </ul>
+                    </div>
+                    <div>
+                        <h4 class="font-semibold text-gray-900 dark:text-white mb-3">API Access</h4>
+                        <p class="text-sm text-gray-600 dark:text-gray-400 mb-2">
+                            Integrate downloads into your applications
+                        </p>
+                        <a href="/docs" class="text-sm text-indigo-600 dark:text-indigo-400 hover:underline">View API Documentation →</a>
+                    </div>
+                </div>
+                <div class="border-t border-gray-200 dark:border-gray-700 mt-8 pt-8 text-center text-sm text-gray-500 dark:text-gray-400">
+                    <p>Files are automatically deleted after 1 hour. We do not store any personal data.</p>
+                    <p class="mt-2">Made with ❤️ using yt-dlp</p>
+                </div>
+            </div>
+        </footer>
+
+    </div>
+
+    <!-- Alpine.js App Logic -->
+    <script>
+        function app() {
+            return {
+                // State
+                darkMode: localStorage.getItem('darkMode') === 'true' || false,
+                url: '',
+                urlInfo: null,
+                videoInfo: null,
+                showAdvanced: false,
+                showMenu: false,
+                downloading: false,
+                downloads: [],
+
+                // Settings
+                selectedQuality: 'best',
+                videoFormat: 'mp4',
+                audioFormat: 'm4a',
+                downloadSubtitles: false,
+                embedThumbnail: true,
+                embedMetadata: true,
+
+                // Init
+                init() {
+                    // Apply dark mode
+                    if (this.darkMode) {
+                        document.documentElement.classList.add('dark');
+                    }
+
+                    // Focus URL input
+                    setTimeout(() => {
+                        document.getElementById('url-input').focus();
+                    }, 100);
+
+                    // Load saved downloads from localStorage
+                    const saved = localStorage.getItem('downloads');
+                    if (saved) {
+                        this.downloads = JSON.parse(saved);
+                    }
+                },
+
+                // Dark mode toggle
+                toggleDarkMode() {
+                    this.darkMode = !this.darkMode;
+                    document.documentElement.classList.toggle('dark');
+                    localStorage.setItem('darkMode', this.darkMode);
+                },
+
+                // Handle paste event
+                handlePaste(event) {
+                    setTimeout(() => this.urlChanged(), 100);
+                },
+
+                // URL changed - detect type
+                urlChanged() {
+                    if (!this.url) {
+                        this.urlInfo = null;
+                        return;
+                    }
+
+                    // Simple detection logic
+                    if (this.url.includes('playlist') || this.url.includes('/c/') || this.url.includes('/@')) {
+                        this.urlInfo = {
+                            type: 'playlist',
+                            videoCount: '~50'
+                        };
+                    } else {
+                        this.urlInfo = {
+                            type: 'video'
+                        };
+                    }
+                },
+
+                // Start download
+                async startDownload(mode) {
+                    if (!this.url || this.downloading) return;
+
+                    this.downloading = true;
+
+                    // Create download object
+                    const download = {
+                        id: Date.now(),
+                        url: this.url,
+                        title: 'Fetching information...',
+                        status: 'downloading',
+                        progress: 0,
+                        speed: '0 MB/s',
+                        downloaded: '0 MB',
+                        totalSize: '0 MB',
+                        eta: 'Calculating...',
+                        fileUrl: null,
+                        error: null
+                    };
+
+                    this.downloads.unshift(download);
+                    this.saveDownloads();
+
+                    // Simulate download progress (replace with actual API calls)
+                    this.simulateDownload(download);
+                },
+
+                // Simulate download (replace with real API integration)
+                simulateDownload(download) {
+                    let progress = 0;
+
+                    const interval = setInterval(() => {
+                        progress += Math.random() * 10;
+
+                        if (progress >= 100) {
+                            progress = 100;
+                            download.status = 'completed';
+                            download.progress = 100;
+                            download.fileUrl = '/downloads/video.mp4';
+                            this.downloading = false;
+                            clearInterval(interval);
+                            this.saveDownloads();
+                            this.showNotification('Download completed!', 'success');
+                        } else {
+                            download.progress = Math.floor(progress);
+                            download.speed = (Math.random() * 5 + 1).toFixed(1) + ' MB/s';
+                            download.downloaded = (progress * 2.65).toFixed(0) + ' MB';
+                            download.totalSize = '265 MB';
+                            download.eta = Math.floor((100 - progress) / 5) + ' seconds';
+                            download.title = 'Sample Video Title';
+                        }
+
+                        this.saveDownloads();
+                    }, 500);
+                },
+
+                // Get video info
+                async getInfo() {
+                    if (!this.url) return;
+
+                    // Mock video info (replace with API call)
+                    this.videoInfo = {
+                        title: 'Sample Video Title',
+                        uploader: 'Channel Name',
+                        thumbnail: 'https://via.placeholder.com/640x360',
+                        views: '1.2M',
+                        duration: '12:34',
+                        fileSize: '265 MB'
+                    };
+                },
+
+                // Pause download
+                pauseDownload(id) {
+                    const download = this.downloads.find(d => d.id === id);
+                    if (download) {
+                        download.status = 'paused';
+                        this.saveDownloads();
+                    }
+                },
+
+                // Retry download
+                retryDownload(id) {
+                    const download = this.downloads.find(d => d.id === id);
+                    if (download) {
+                        download.status = 'downloading';
+                        download.progress = 0;
+                        download.error = null;
+                        this.simulateDownload(download);
+                    }
+                },
+
+                // Remove download
+                removeDownload(id) {
+                    this.downloads = this.downloads.filter(d => d.id !== id);
+                    this.saveDownloads();
+                },
+
+                // Open file
+                openFile(url) {
+                    window.open(url, '_blank');
+                },
+
+                // Save downloads to localStorage
+                saveDownloads() {
+                    localStorage.setItem('downloads', JSON.stringify(this.downloads.slice(0, 10)));
+                },
+
+                // Show notification
+                showNotification(message, type = 'info') {
+                    // Simple notification (can be enhanced)
+                    console.log(`[${type.toUpperCase()}] ${message}`);
+                }
+            }
+        }
+    </script>
+</body>
+</html>

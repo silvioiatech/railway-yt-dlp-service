@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Playlist Browser - Ultimate Downloader</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+
+    <style>
+        /* Lazy loading skeleton */
+        .skeleton {
+            background: linear-gradient(90deg, #f0f0f0 25%, #e0e0e0 50%, #f0f0f0 75%);
+            background-size: 200% 100%;
+            animation: loading 1.5s infinite;
+        }
+
+        @keyframes loading {
+            0% { background-position: 200% 0; }
+            100% { background-position: -200% 0; }
+        }
+
+        .dark .skeleton {
+            background: linear-gradient(90deg, #374151 25%, #4b5563 50%, #374151 75%);
+            background-size: 200% 100%;
+        }
+
+        /* Image fade-in */
+        img.loaded {
+            animation: fadeIn 0.3s ease-in;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+
+        /* Selection checkbox animation */
+        .checkbox-card {
+            transition: all 0.2s ease;
+        }
+
+        .checkbox-card.selected {
+            transform: scale(0.98);
+            box-shadow: 0 0 0 2px #6366f1;
+        }
+    </style>
+</head>
+<body class="h-full bg-gray-50 dark:bg-gray-900" x-data="playlistBrowser()" x-cloak>
+
+    <div class="min-h-full">
+
+        <!-- Header -->
+        <header class="bg-white dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700 sticky top-0 z-40">
+            <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                <div class="flex items-center justify-between h-16">
+                    <div class="flex items-center space-x-4">
+                        <a href="/" class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-200">
+                            <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18"></path>
+                            </svg>
+                        </a>
+                        <div>
+                            <h1 class="text-xl font-bold text-gray-900 dark:text-white" x-text="playlist.title || 'Playlist Browser'"></h1>
+                            <p class="text-sm text-gray-500 dark:text-gray-400">
+                                <span x-text="playlist.videoCount || 0"></span> videos
+                                <span x-show="selectedVideos.length > 0"> • <span x-text="selectedVideos.length"></span> selected</span>
+                            </p>
+                        </div>
+                    </div>
+
+                    <!-- View Toggle -->
+                    <div class="flex items-center space-x-2">
+                        <button
+                            @click="viewMode = 'grid'"
+                            :class="viewMode === 'grid' ? 'bg-indigo-100 text-indigo-600 dark:bg-indigo-900 dark:text-indigo-300' : 'text-gray-400 hover:text-gray-600'"
+                            class="p-2 rounded-lg transition-colors"
+                        >
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z"></path>
+                            </svg>
+                        </button>
+                        <button
+                            @click="viewMode = 'list'"
+                            :class="viewMode === 'list' ? 'bg-indigo-100 text-indigo-600 dark:bg-indigo-900 dark:text-indigo-300' : 'text-gray-400 hover:text-gray-600'"
+                            class="p-2 rounded-lg transition-colors"
+                        >
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"></path>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Toolbar -->
+                <div class="flex items-center justify-between py-4 border-t border-gray-200 dark:border-gray-700">
+                    <!-- Selection Actions -->
+                    <div class="flex items-center space-x-2">
+                        <button
+                            @click="selectAll()"
+                            class="px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors"
+                        >
+                            Select All
+                        </button>
+                        <button
+                            @click="invertSelection()"
+                            class="px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors"
+                        >
+                            Invert
+                        </button>
+                        <button
+                            @click="clearSelection()"
+                            :disabled="selectedVideos.length === 0"
+                            class="px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                            Clear
+                        </button>
+                    </div>
+
+                    <!-- Search -->
+                    <div class="relative">
+                        <input
+                            type="text"
+                            x-model="searchQuery"
+                            @input="filterVideos()"
+                            placeholder="Search videos..."
+                            class="pl-10 pr-4 py-2 w-64 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/20 outline-none"
+                        >
+                        <svg class="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path>
+                        </svg>
+                    </div>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+
+            <!-- Loading State -->
+            <div x-show="loading" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                <template x-for="i in 12" :key="i">
+                    <div class="bg-white dark:bg-gray-800 rounded-lg overflow-hidden">
+                        <div class="skeleton aspect-video"></div>
+                        <div class="p-4 space-y-2">
+                            <div class="skeleton h-4 rounded"></div>
+                            <div class="skeleton h-3 w-2/3 rounded"></div>
+                        </div>
+                    </div>
+                </template>
+            </div>
+
+            <!-- Grid View -->
+            <div
+                x-show="!loading && viewMode === 'grid'"
+                class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4"
+            >
+                <template x-for="video in filteredVideos" :key="video.id">
+                    <div
+                        @click="toggleVideo(video.id)"
+                        class="checkbox-card bg-white dark:bg-gray-800 rounded-lg overflow-hidden border-2 border-transparent cursor-pointer hover:border-gray-300 dark:hover:border-gray-600"
+                        :class="{ 'selected border-indigo-500': selectedVideos.includes(video.id) }"
+                    >
+                        <!-- Thumbnail -->
+                        <div class="relative aspect-video bg-gray-200 dark:bg-gray-700">
+                            <img
+                                :src="video.thumbnail"
+                                :alt="video.title"
+                                loading="lazy"
+                                @load="$el.classList.add('loaded')"
+                                class="w-full h-full object-cover"
+                            >
+                            <!-- Duration Badge -->
+                            <div class="absolute bottom-2 right-2 px-2 py-1 bg-black/80 text-white text-xs font-semibold rounded">
+                                <span x-text="video.duration"></span>
+                            </div>
+                            <!-- Selection Overlay -->
+                            <div
+                                x-show="selectedVideos.includes(video.id)"
+                                class="absolute inset-0 bg-indigo-600/20 flex items-center justify-center"
+                            >
+                                <div class="w-12 h-12 bg-indigo-600 rounded-full flex items-center justify-center">
+                                    <svg class="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"></path>
+                                    </svg>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Info -->
+                        <div class="p-4">
+                            <h3 class="font-semibold text-gray-900 dark:text-white line-clamp-2 mb-2" x-text="video.title"></h3>
+                            <div class="flex items-center text-sm text-gray-500 dark:text-gray-400 space-x-3">
+                                <span x-text="video.views"></span>
+                                <span>•</span>
+                                <span x-text="video.uploadDate"></span>
+                            </div>
+                        </div>
+                    </div>
+                </template>
+            </div>
+
+            <!-- List View -->
+            <div
+                x-show="!loading && viewMode === 'list'"
+                class="bg-white dark:bg-gray-800 rounded-lg overflow-hidden"
+            >
+                <template x-for="video in filteredVideos" :key="video.id">
+                    <div
+                        @click="toggleVideo(video.id)"
+                        class="flex items-center p-4 border-b border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700 cursor-pointer transition-colors"
+                        :class="{ 'bg-indigo-50 dark:bg-indigo-900/20': selectedVideos.includes(video.id) }"
+                    >
+                        <!-- Checkbox -->
+                        <div class="mr-4">
+                            <div
+                                class="w-6 h-6 rounded border-2 flex items-center justify-center transition-colors"
+                                :class="selectedVideos.includes(video.id) ? 'border-indigo-600 bg-indigo-600' : 'border-gray-300 dark:border-gray-600'"
+                            >
+                                <svg
+                                    x-show="selectedVideos.includes(video.id)"
+                                    class="w-4 h-4 text-white"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    viewBox="0 0 24 24"
+                                >
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"></path>
+                                </svg>
+                            </div>
+                        </div>
+
+                        <!-- Thumbnail -->
+                        <div class="w-40 aspect-video bg-gray-200 dark:bg-gray-700 rounded overflow-hidden flex-shrink-0">
+                            <img
+                                :src="video.thumbnail"
+                                :alt="video.title"
+                                loading="lazy"
+                                class="w-full h-full object-cover"
+                            >
+                        </div>
+
+                        <!-- Info -->
+                        <div class="ml-4 flex-1 min-w-0">
+                            <h3 class="font-semibold text-gray-900 dark:text-white mb-1" x-text="video.title"></h3>
+                            <p class="text-sm text-gray-500 dark:text-gray-400 line-clamp-2" x-text="video.description"></p>
+                            <div class="flex items-center text-sm text-gray-500 dark:text-gray-400 space-x-3 mt-2">
+                                <span x-text="video.uploader"></span>
+                                <span>•</span>
+                                <span x-text="video.views"></span>
+                                <span>•</span>
+                                <span x-text="video.duration"></span>
+                            </div>
+                        </div>
+
+                        <!-- Actions -->
+                        <div class="ml-4 flex-shrink-0">
+                            <button
+                                @click.stop="downloadSingle(video.id)"
+                                class="p-2 text-indigo-600 hover:bg-indigo-100 dark:hover:bg-indigo-900 rounded-lg transition-colors"
+                                title="Download this video"
+                            >
+                                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path>
+                                </svg>
+                            </button>
+                        </div>
+                    </div>
+                </template>
+            </div>
+
+            <!-- Empty State -->
+            <div
+                x-show="!loading && filteredVideos.length === 0"
+                class="text-center py-12"
+            >
+                <svg class="w-16 h-16 text-gray-400 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path>
+                </svg>
+                <h3 class="text-lg font-semibold text-gray-900 dark:text-white mb-2">No videos found</h3>
+                <p class="text-gray-500 dark:text-gray-400">Try adjusting your search query</p>
+            </div>
+
+        </main>
+
+        <!-- Download Bar (Fixed Bottom) -->
+        <div
+            x-show="selectedVideos.length > 0"
+            x-transition
+            class="fixed bottom-0 left-0 right-0 bg-white dark:bg-gray-800 border-t border-gray-200 dark:border-gray-700 shadow-2xl z-50"
+        >
+            <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
+                <div class="flex items-center justify-between">
+                    <div>
+                        <p class="font-semibold text-gray-900 dark:text-white">
+                            <span x-text="selectedVideos.length"></span> video<span x-show="selectedVideos.length !== 1">s</span> selected
+                        </p>
+                        <p class="text-sm text-gray-500 dark:text-gray-400">
+                            Estimated size: <span x-text="estimatedSize"></span>
+                        </p>
+                    </div>
+
+                    <div class="flex items-center space-x-3">
+                        <button
+                            @click="clearSelection()"
+                            class="px-6 py-3 bg-gray-200 dark:bg-gray-700 text-gray-700 dark:text-gray-300 font-semibold rounded-lg hover:bg-gray-300 dark:hover:bg-gray-600 transition-colors"
+                        >
+                            Cancel
+                        </button>
+                        <button
+                            @click="downloadSelected()"
+                            class="px-6 py-3 bg-gradient-to-r from-indigo-600 to-purple-600 text-white font-bold rounded-lg hover:from-indigo-700 hover:to-purple-700 shadow-lg transition-all"
+                        >
+                            Download Selected
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <script>
+        function playlistBrowser() {
+            return {
+                loading: true,
+                viewMode: 'grid',
+                searchQuery: '',
+                selectedVideos: [],
+                playlist: {},
+                videos: [],
+                filteredVideos: [],
+
+                init() {
+                    // Simulate loading playlist
+                    setTimeout(() => {
+                        this.loadPlaylist();
+                    }, 1000);
+                },
+
+                loadPlaylist() {
+                    // Mock data (replace with API call)
+                    this.playlist = {
+                        id: 'PLxxx',
+                        title: 'My Awesome Playlist',
+                        videoCount: 50,
+                        uploader: 'Channel Name'
+                    };
+
+                    this.videos = Array.from({ length: 50 }, (_, i) => ({
+                        id: `video-${i + 1}`,
+                        title: `Video Title ${i + 1} - This is a longer title to test truncation`,
+                        description: 'This is a video description that provides more context about the content.',
+                        thumbnail: `https://picsum.photos/320/180?random=${i}`,
+                        duration: this.randomDuration(),
+                        uploader: 'Channel Name',
+                        views: this.randomViews(),
+                        uploadDate: this.randomDate()
+                    }));
+
+                    this.filteredVideos = [...this.videos];
+                    this.loading = false;
+                },
+
+                filterVideos() {
+                    if (!this.searchQuery) {
+                        this.filteredVideos = [...this.videos];
+                        return;
+                    }
+
+                    const query = this.searchQuery.toLowerCase();
+                    this.filteredVideos = this.videos.filter(video =>
+                        video.title.toLowerCase().includes(query) ||
+                        video.description.toLowerCase().includes(query)
+                    );
+                },
+
+                toggleVideo(id) {
+                    if (this.selectedVideos.includes(id)) {
+                        this.selectedVideos = this.selectedVideos.filter(v => v !== id);
+                    } else {
+                        this.selectedVideos.push(id);
+                    }
+                },
+
+                selectAll() {
+                    this.selectedVideos = this.filteredVideos.map(v => v.id);
+                },
+
+                invertSelection() {
+                    const all = this.filteredVideos.map(v => v.id);
+                    this.selectedVideos = all.filter(id => !this.selectedVideos.includes(id));
+                },
+
+                clearSelection() {
+                    this.selectedVideos = [];
+                },
+
+                downloadSelected() {
+                    alert(`Downloading ${this.selectedVideos.length} videos...`);
+                    // Implement download logic
+                },
+
+                downloadSingle(id) {
+                    alert(`Downloading video: ${id}`);
+                },
+
+                get estimatedSize() {
+                    const avgSize = 265; // MB
+                    const total = (this.selectedVideos.length * avgSize / 1024).toFixed(1);
+                    return `${total} GB`;
+                },
+
+                // Helper functions
+                randomDuration() {
+                    const minutes = Math.floor(Math.random() * 45) + 1;
+                    const seconds = Math.floor(Math.random() * 60);
+                    return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+                },
+
+                randomViews() {
+                    const views = Math.floor(Math.random() * 10000000);
+                    if (views > 1000000) return (views / 1000000).toFixed(1) + 'M views';
+                    if (views > 1000) return (views / 1000).toFixed(1) + 'K views';
+                    return views + ' views';
+                },
+
+                randomDate() {
+                    const days = Math.floor(Math.random() * 365);
+                    if (days === 0) return 'Today';
+                    if (days === 1) return 'Yesterday';
+                    if (days < 7) return days + ' days ago';
+                    if (days < 30) return Math.floor(days / 7) + ' weeks ago';
+                    if (days < 365) return Math.floor(days / 30) + ' months ago';
+                    return Math.floor(days / 365) + ' years ago';
+                }
+            }
+        }
+    </script>
+</body>
+</html>
