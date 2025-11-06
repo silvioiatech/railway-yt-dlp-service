@@ -1,0 +1,52 @@
+{
+  "test_batch_small": [
+    "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    "https://www.youtube.com/watch?v=9bZkp7q19f0",
+    "https://www.youtube.com/watch?v=kJQP7kiw5Fk"
+  ],
+  "test_batch_medium": [
+    "https://www.youtube.com/watch?v=video001",
+    "https://www.youtube.com/watch?v=video002",
+    "https://www.youtube.com/watch?v=video003",
+    "https://www.youtube.com/watch?v=video004",
+    "https://www.youtube.com/watch?v=video005",
+    "https://www.youtube.com/watch?v=video006",
+    "https://www.youtube.com/watch?v=video007",
+    "https://www.youtube.com/watch?v=video008",
+    "https://www.youtube.com/watch?v=video009",
+    "https://www.youtube.com/watch?v=video010"
+  ],
+  "test_batch_large": [
+    "https://example.com/video01",
+    "https://example.com/video02",
+    "https://example.com/video03",
+    "https://example.com/video04",
+    "https://example.com/video05",
+    "https://example.com/video06",
+    "https://example.com/video07",
+    "https://example.com/video08",
+    "https://example.com/video09",
+    "https://example.com/video10",
+    "https://example.com/video11",
+    "https://example.com/video12",
+    "https://example.com/video13",
+    "https://example.com/video14",
+    "https://example.com/video15",
+    "https://example.com/video16",
+    "https://example.com/video17",
+    "https://example.com/video18",
+    "https://example.com/video19",
+    "https://example.com/video20"
+  ],
+  "test_batch_mixed_platforms": [
+    "https://www.youtube.com/watch?v=abc123",
+    "https://vimeo.com/123456789",
+    "https://www.dailymotion.com/video/x123abc",
+    "https://www.twitch.tv/videos/123456789"
+  ],
+  "test_batch_with_invalid": [
+    "https://www.youtube.com/watch?v=valid_video_1",
+    "not_a_valid_url",
+    "https://www.youtube.com/watch?v=valid_video_2"
+  ]
+}

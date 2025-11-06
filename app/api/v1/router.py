@@ -6,7 +6,7 @@ and tags for OpenAPI documentation.
 """
 from fastapi import APIRouter
 
-from app.api.v1 import auth, download, health, metadata, playlist
+from app.api.v1 import batch, channel, cookies, download, health, metadata, playlist
 
 # Create main v1 router
 api_router = APIRouter(prefix="/api/v1")
@@ -14,8 +14,11 @@ api_router = APIRouter(prefix="/api/v1")
 # Include all sub-routers
 api_router.include_router(health.router)
 api_router.include_router(download.router)
+api_router.include_router(batch.router)
 api_router.include_router(metadata.router)
 api_router.include_router(playlist.router)
+api_router.include_router(channel.router)
+api_router.include_router(cookies.router)
 
 
 # Export router for use in main application

@@ -99,6 +99,18 @@ class MetadataExtractionError(MediaDownloaderException):
 
 
 # Validation exceptions
+class ValidationError(MediaDownloaderException):
+    """General validation error."""
+
+    def __init__(self, message: str, details: Optional[Dict[str, Any]] = None):
+        super().__init__(
+            message=message,
+            status_code=400,
+            error_code='VALIDATION_ERROR',
+            details=details
+        )
+
+
 class InvalidURLError(MediaDownloaderException):
     """Invalid or unsupported URL."""
 

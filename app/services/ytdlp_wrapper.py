@@ -17,6 +17,7 @@ from app.core.exceptions import (
     DownloadError,
     DownloadTimeoutError,
     MetadataExtractionError,
+    ValidationError,
 )
 from app.models.requests import (
     ChannelDownloadRequest,
@@ -168,11 +169,51 @@ class YtdlpWrapper:
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         self.options_builder = YtdlpOptionsBuilder(self.storage_dir)
 
+    def _get_cookies_path(self, cookies_id: Optional[str]) -> Optional[Path]:
+        """
+        Get cookie file path from cookie ID.
+
+        Args:
+            cookies_id: Cookie identifier
+
+        Returns:
+            Path to temporary cookie file or None
+
+        Raises:
+            ValidationError: If cookie not found
+        """
+        if not cookies_id:
+            return None
+
+        try:
+            from app.services.cookie_manager import get_cookie_manager
+            cookie_manager = get_cookie_manager()
+            cookie_path = cookie_manager.get_cookie_file_path(cookies_id)
+            logger.info(f"Using cookies from: {cookies_id}")
+            return cookie_path
+        except Exception as e:
+            logger.error(f"Failed to get cookies {cookies_id}: {e}")
+            raise ValidationError(f"Invalid or expired cookies ID: {cookies_id}")
+
+    def _cleanup_cookies_file(self, cookies_path: Optional[Path]) -> None:
+        """
+        Clean up temporary cookies file.
+
+        Args:
+            cookies_path: Path to temporary cookies file
+        """
+        if cookies_path and cookies_path.exists():
+            try:
+                cookies_path.unlink()
+                logger.debug(f"Cleaned up temporary cookie file: {cookies_path}")
+            except Exception as e:
+                logger.warning(f"Failed to cleanup cookie file: {e}")
+
     async def extract_info(
         self,
         url: str,
         download: bool = False,
-        cookies_path: Optional[Path] = None,
+        cookies_id: Optional[str] = None,
         timeout_sec: int = 60
     ) -> Dict[str, Any]:
         """
@@ -181,7 +222,7 @@ class YtdlpWrapper:
         Args:
             url: Video or playlist URL
             download: Whether to download the video
-            cookies_path: Path to cookies file for authentication
+            cookies_id: Cookie ID for authentication
             timeout_sec: Timeout for metadata extraction
 
         Returns:
@@ -190,7 +231,10 @@ class YtdlpWrapper:
         Raises:
             MetadataExtractionError: If extraction fails
             DownloadTimeoutError: If extraction times out
+            ValidationError: If cookie ID is invalid
         """
+        cookies_path = self._get_cookies_path(cookies_id) if cookies_id else None
+
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
@@ -223,6 +267,9 @@ class YtdlpWrapper:
             logger.error(f"Metadata extraction failed for {url}: {e}")
             raise MetadataExtractionError(str(e), url)
 
+        finally:
+            self._cleanup_cookies_file(cookies_path)
+
     def _extract_info_sync(self, url: str, opts: Dict[str, Any]) -> Dict[str, Any]:
         """
         Synchronous metadata extraction (runs in executor).
@@ -241,22 +288,23 @@ class YtdlpWrapper:
     async def get_formats(
         self,
         url: str,
-        cookies_path: Optional[Path] = None
+        cookies_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Get available formats for a URL with recommendations.
 
         Args:
             url: Video URL
-            cookies_path: Path to cookies file
+            cookies_id: Cookie ID for authentication
 
         Returns:
             Dictionary with categorized formats and recommendations
 
         Raises:
             MetadataExtractionError: If format detection fails
+            ValidationError: If cookie ID is invalid
         """
-        info = await self.extract_info(url, download=False, cookies_path=cookies_path)
+        info = await self.extract_info(url, download=False, cookies_id=cookies_id)
 
         formats = info.get('formats', [])
 
@@ -353,7 +401,6 @@ class YtdlpWrapper:
         self,
         request_id: str,
         request: DownloadRequest,
-        cookies_path: Optional[Path] = None,
         progress_callback: Optional[Callable] = None
     ) -> Dict[str, Any]:
         """
@@ -362,7 +409,6 @@ class YtdlpWrapper:
         Args:
             request_id: Unique request identifier
             request: Download request with options
-            cookies_path: Path to cookies file
             progress_callback: Callback for progress updates
 
         Returns:
@@ -371,13 +417,18 @@ class YtdlpWrapper:
         Raises:
             DownloadError: If download fails
             DownloadTimeoutError: If download times out
+            ValidationError: If cookie ID is invalid
         """
+        # Get cookies path if cookies_id provided
+        cookies_path = self._get_cookies_path(request.cookies_id) if request.cookies_id else None
+
         # Build yt-dlp options
         ydl_opts = self.options_builder.build_from_request(request, request_id)
 
         # Add cookies if provided
         if cookies_path and cookies_path.exists():
             ydl_opts['cookiefile'] = str(cookies_path)
+            logger.debug(f"Using cookies for request {request_id}")
 
         # Add progress hook
         progress_tracker = ProgressTracker(request_id, progress_callback)
@@ -417,6 +468,9 @@ class YtdlpWrapper:
             logger.error(f"Download failed for {request_id}: {e}", exc_info=True)
             raise DownloadError(str(e))
 
+        finally:
+            self._cleanup_cookies_file(cookies_path)
+
     def _download_sync(self, url: str, opts: Dict[str, Any]) -> Dict[str, Any]:
         """
         Synchronous download execution (runs in executor).
@@ -452,7 +506,6 @@ class YtdlpWrapper:
         self,
         request_id: str,
         request: PlaylistDownloadRequest,
-        cookies_path: Optional[Path] = None,
         progress_callback: Optional[Callable] = None
     ) -> Dict[str, Any]:
         """
@@ -461,7 +514,6 @@ class YtdlpWrapper:
         Args:
             request_id: Unique request identifier
             request: Playlist download request
-            cookies_path: Path to cookies file
             progress_callback: Callback for progress updates
 
         Returns:
@@ -469,12 +521,17 @@ class YtdlpWrapper:
 
         Raises:
             DownloadError: If download fails
+            ValidationError: If cookie ID is invalid
         """
+        # Get cookies path if cookies_id provided
+        cookies_path = self._get_cookies_path(request.cookies_id) if request.cookies_id else None
+
         # Build options for playlist
         ydl_opts = self.options_builder.build_playlist_options(request, request_id)
 
         if cookies_path and cookies_path.exists():
             ydl_opts['cookiefile'] = str(cookies_path)
+            logger.debug(f"Using cookies for playlist request {request_id}")
 
         # Progress tracking
         progress_tracker = ProgressTracker(request_id, progress_callback)
@@ -501,6 +558,9 @@ class YtdlpWrapper:
         except Exception as e:
             logger.error(f"Playlist download failed for {request_id}: {e}", exc_info=True)
             raise DownloadError(f"Playlist download failed: {str(e)}")
+
+        finally:
+            self._cleanup_cookies_file(cookies_path)
 
     def _download_playlist_sync(
         self,
@@ -537,7 +597,6 @@ class YtdlpWrapper:
         self,
         request_id: str,
         request: ChannelDownloadRequest,
-        cookies_path: Optional[Path] = None,
         progress_callback: Optional[Callable] = None
     ) -> Dict[str, Any]:
         """
@@ -546,7 +605,6 @@ class YtdlpWrapper:
         Args:
             request_id: Unique request identifier
             request: Channel download request
-            cookies_path: Path to cookies file
             progress_callback: Callback for progress updates
 
         Returns:
@@ -554,12 +612,17 @@ class YtdlpWrapper:
 
         Raises:
             DownloadError: If download fails
+            ValidationError: If cookie ID is invalid
         """
+        # Get cookies path if cookies_id provided
+        cookies_path = self._get_cookies_path(request.cookies_id) if request.cookies_id else None
+
         # Build options for channel
         ydl_opts = self.options_builder.build_channel_options(request, request_id)
 
         if cookies_path and cookies_path.exists():
             ydl_opts['cookiefile'] = str(cookies_path)
+            logger.debug(f"Using cookies for channel request {request_id}")
 
         # Progress tracking
         progress_tracker = ProgressTracker(request_id, progress_callback)
@@ -586,6 +649,9 @@ class YtdlpWrapper:
         except Exception as e:
             logger.error(f"Channel download failed for {request_id}: {e}", exc_info=True)
             raise DownloadError(f"Channel download failed: {str(e)}")
+
+        finally:
+            self._cleanup_cookies_file(cookies_path)
 
     def _download_channel_sync(
         self,

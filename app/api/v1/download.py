@@ -3,6 +3,7 @@ Download endpoints for the Ultimate Media Downloader API.
 
 Provides endpoints for creating, monitoring, and managing single video downloads.
 """
+import asyncio
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -32,6 +33,11 @@ from app.models.responses import (
 )
 from app.services.queue_manager import QueueManager, get_queue_manager
 from app.services.ytdlp_wrapper import YtdlpWrapper
+from app.services.webhook_service import (
+    WebhookDeliveryService,
+    WebhookEvent,
+    get_webhook_service,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -84,15 +90,32 @@ async def process_download_job(
         logger.error(f"Job {request_id} not found in state manager")
         return
 
+    # Get webhook service
+    webhook_service = get_webhook_service()
+    webhook_url = str(payload.webhook_url) if payload.webhook_url else None
+
     try:
         # Mark job as running
         job.set_running()
         job.add_log("Starting download", "INFO")
 
+        # Send download.started webhook
+        if webhook_url:
+            await webhook_service.send_webhook(
+                url=webhook_url,
+                event_type=WebhookEvent.DOWNLOAD_STARTED,
+                payload={
+                    "request_id": request_id,
+                    "url": payload.url,
+                    "status": "started",
+                    "timestamp": datetime.now(timezone.utc).isoformat() + "Z"
+                }
+            )
+
         # Create ytdlp wrapper
         ytdlp = YtdlpWrapper(storage_dir=settings.STORAGE_DIR)
 
-        # Progress callback
+        # Progress callback with webhook support
         def progress_callback(progress_data: Dict[str, Any]):
             """Update job progress from yt-dlp."""
             if progress_data.get('status') == 'downloading':
@@ -103,6 +126,30 @@ async def process_download_job(
                     speed=progress_data.get('speed', 0.0),
                     eta=progress_data.get('eta')
                 )
+
+                # Send progress webhook (throttled internally)
+                if webhook_url:
+                    # Fire and forget webhook (don't await to avoid blocking download)
+                    asyncio.create_task(
+                        webhook_service.send_webhook(
+                            url=webhook_url,
+                            event_type=WebhookEvent.DOWNLOAD_PROGRESS,
+                            payload={
+                                "request_id": request_id,
+                                "url": payload.url,
+                                "status": "downloading",
+                                "progress": {
+                                    "percent": job.progress_percent,
+                                    "downloaded_bytes": job.bytes_downloaded,
+                                    "total_bytes": job.bytes_total,
+                                    "speed": job.download_speed,
+                                    "eta": job.eta_seconds
+                                },
+                                "timestamp": datetime.now(timezone.utc).isoformat() + "Z"
+                            }
+                        )
+                    )
+
             elif progress_data.get('status') == 'post_processing':
                 job.add_log("Post-processing download", "INFO")
             elif progress_data.get('status') == 'error':
@@ -134,6 +181,26 @@ async def process_download_job(
             job.add_log(f"Download completed: {file_path.name}", "INFO")
 
             logger.info(f"Download completed successfully: {request_id}")
+
+            # Send download.completed webhook
+            if webhook_url:
+                await webhook_service.send_webhook(
+                    url=webhook_url,
+                    event_type=WebhookEvent.DOWNLOAD_COMPLETED,
+                    payload={
+                        "request_id": request_id,
+                        "url": payload.url,
+                        "title": job.metadata.get('title'),
+                        "file_url": file_url,
+                        "file_path": str(relative_path),
+                        "file_size": file_size,
+                        "status": "completed",
+                        "duration": job.metadata.get('duration'),
+                        "timestamp": datetime.now(timezone.utc).isoformat() + "Z"
+                    }
+                )
+                # Clean up throttle cache
+                await webhook_service.cleanup_throttle_cache(request_id)
         else:
             raise DownloadError(f"Downloaded file not found: {file_path}")
 
@@ -142,15 +209,63 @@ async def process_download_job(
         job.set_failed(f"Download timeout: {e.message}")
         job.add_log(f"Download timeout: {e.message}", "ERROR")
 
+        # Send download.failed webhook
+        if webhook_url:
+            await webhook_service.send_webhook(
+                url=webhook_url,
+                event_type=WebhookEvent.DOWNLOAD_FAILED,
+                payload={
+                    "request_id": request_id,
+                    "url": payload.url,
+                    "status": "failed",
+                    "error": f"Download timeout: {e.message}",
+                    "error_type": "timeout",
+                    "timestamp": datetime.now(timezone.utc).isoformat() + "Z"
+                }
+            )
+            await webhook_service.cleanup_throttle_cache(request_id)
+
     except DownloadError as e:
         logger.error(f"Download error for {request_id}: {e}")
         job.set_failed(str(e))
         job.add_log(f"Download failed: {e}", "ERROR")
 
+        # Send download.failed webhook
+        if webhook_url:
+            await webhook_service.send_webhook(
+                url=webhook_url,
+                event_type=WebhookEvent.DOWNLOAD_FAILED,
+                payload={
+                    "request_id": request_id,
+                    "url": payload.url,
+                    "status": "failed",
+                    "error": str(e),
+                    "error_type": "download_error",
+                    "timestamp": datetime.now(timezone.utc).isoformat() + "Z"
+                }
+            )
+            await webhook_service.cleanup_throttle_cache(request_id)
+
     except Exception as e:
         logger.error(f"Unexpected error for {request_id}: {e}", exc_info=True)
         job.set_failed(f"Unexpected error: {str(e)}")
         job.add_log(f"Unexpected error: {str(e)}", "ERROR")
+
+        # Send download.failed webhook
+        if webhook_url:
+            await webhook_service.send_webhook(
+                url=webhook_url,
+                event_type=WebhookEvent.DOWNLOAD_FAILED,
+                payload={
+                    "request_id": request_id,
+                    "url": payload.url,
+                    "status": "failed",
+                    "error": str(e),
+                    "error_type": "unexpected_error",
+                    "timestamp": datetime.now(timezone.utc).isoformat() + "Z"
+                }
+            )
+            await webhook_service.cleanup_throttle_cache(request_id)
 
 
 def convert_job_to_response(job: JobState, settings: Settings) -> DownloadResponse:

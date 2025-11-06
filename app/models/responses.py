@@ -428,16 +428,53 @@ class LogsResponse(BaseModel):
     truncated: bool = Field(False, description="Whether logs were truncated")
 
 
-class CookiesResponse(BaseModel):
-    """Response model for cookies upload."""
+class CookieResponse(BaseModel):
+    """Response model for a single cookie set."""
 
     cookie_id: str = Field(..., description="Unique cookie set identifier")
     name: str = Field(..., description="Cookie set name")
     created_at: datetime = Field(..., description="Creation timestamp")
-    expires_at: Optional[datetime] = Field(None, description="Expiration timestamp")
     browser: Optional[str] = Field(None, description="Browser extracted from")
-    domains: List[str] = Field(default_factory=list, description="Domains covered")
+    domains: List[str] = Field(default_factory=list, description="Domains covered by cookies")
     status: str = Field("active", description="Cookie status (active, expired)")
+
+    class Config:
+        """Pydantic configuration."""
+        json_schema_extra = {
+            "example": {
+                "cookie_id": "550e8400-e29b-41d4-a716-446655440000",
+                "name": "my_auth_cookies",
+                "created_at": "2025-11-06T10:00:00Z",
+                "browser": "chrome",
+                "domains": ["example.com", "auth.example.com"],
+                "status": "active"
+            }
+        }
+
+
+class CookieListResponse(BaseModel):
+    """Response model for list of cookies."""
+
+    cookies: List[CookieResponse] = Field(..., description="List of stored cookie sets")
+    total: int = Field(..., ge=0, description="Total number of cookie sets")
+
+    class Config:
+        """Pydantic configuration."""
+        json_schema_extra = {
+            "example": {
+                "cookies": [
+                    {
+                        "cookie_id": "550e8400-e29b-41d4-a716-446655440000",
+                        "name": "my_auth_cookies",
+                        "created_at": "2025-11-06T10:00:00Z",
+                        "browser": "chrome",
+                        "domains": ["example.com"],
+                        "status": "active"
+                    }
+                ],
+                "total": 1
+            }
+        }
 
 
 class CancelResponse(BaseModel):

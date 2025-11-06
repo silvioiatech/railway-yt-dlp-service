@@ -24,26 +24,55 @@ export function formatBytes(bytes, decimals = 2) {
 /**
  * Format seconds to human-readable duration
  * @param {number} seconds - Duration in seconds
- * @returns {string} Formatted string (e.g., "1h 23m 45s")
+ * @returns {string} Formatted string (e.g., "1:23:45")
  */
 export function formatDuration(seconds) {
-    if (!seconds || seconds < 0) return 'N/A';
+    if (!seconds || seconds < 0) return '0:00';
 
     const hours = Math.floor(seconds / 3600);
     const minutes = Math.floor((seconds % 3600) / 60);
     const secs = Math.floor(seconds % 60);
 
     if (hours > 0) {
-        return `${hours}h ${minutes}m ${secs}s`;
-    } else if (minutes > 0) {
-        return `${minutes}m ${secs}s`;
+        return `${hours}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
     } else {
-        return `${secs}s`;
+        return `${minutes}:${secs.toString().padStart(2, '0')}`;
     }
 }
 
 /**
- * Format date to relative time (e.g., "2 minutes ago")
+ * Format date to relative time or absolute
+ * @param {string|Date} date - Date string or Date object
+ * @returns {string} Formatted time string
+ */
+export function formatDate(date) {
+    if (!date) return 'Unknown';
+
+    try {
+        const now = new Date();
+        const then = new Date(date);
+        const diffMs = now - then;
+        const diffSecs = Math.floor(diffMs / 1000);
+
+        if (diffSecs < 60) return 'just now';
+        if (diffSecs < 3600) return `${Math.floor(diffSecs / 60)} min ago`;
+        if (diffSecs < 86400) return `${Math.floor(diffSecs / 3600)} hours ago`;
+        if (diffSecs < 604800) return `${Math.floor(diffSecs / 86400)} days ago`;
+
+        return then.toLocaleDateString(undefined, {
+            year: 'numeric',
+            month: 'short',
+            day: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit'
+        });
+    } catch (e) {
+        return date.toString();
+    }
+}
+
+/**
+ * Format relative time (e.g., "2 minutes ago")
  * @param {string|Date} date - Date string or Date object
  * @returns {string} Relative time string
  */
@@ -291,8 +320,8 @@ export async function showNotification(title, options = {}) {
     try {
         if (Notification.permission === 'granted') {
             new Notification(title, {
-                icon: '/static/icon-192.png',
-                badge: '/static/icon-192.png',
+                icon: '/static/icons/icon-192.png',
+                badge: '/static/icons/icon-192.png',
                 ...options
             });
             return true;
@@ -300,8 +329,8 @@ export async function showNotification(title, options = {}) {
             const permission = await Notification.requestPermission();
             if (permission === 'granted') {
                 new Notification(title, {
-                    icon: '/static/icon-192.png',
-                    badge: '/static/icon-192.png',
+                    icon: '/static/icons/icon-192.png',
+                    badge: '/static/icons/icon-192.png',
                     ...options
                 });
                 return true;
@@ -321,10 +350,10 @@ export async function showNotification(title, options = {}) {
  * @param {number} baseDelay - Base delay in milliseconds
  * @returns {Promise<*>} Result of function
  */
-export async function retryWithBackoff(fn, maxRetries = 3, baseDelay = 1000) {
+export function retryWithBackoff(fn, maxRetries = 3, baseDelay = 1000) {
     for (let i = 0; i < maxRetries; i++) {
         try {
-            return await fn();
+            return fn();
         } catch (error) {
             if (i === maxRetries - 1) throw error;
 

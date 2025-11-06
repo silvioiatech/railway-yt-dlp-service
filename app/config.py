@@ -105,6 +105,24 @@ class Settings(BaseSettings):
         description="Whitelist of allowed domains (comma-separated, empty = all allowed)"
     )
 
+    # Webhook Configuration
+    WEBHOOK_ENABLE: bool = Field(
+        default=True,
+        description="Enable webhook notification system"
+    )
+    WEBHOOK_TIMEOUT_SEC: int = Field(
+        default=10,
+        ge=1,
+        le=60,
+        description="Webhook request timeout in seconds"
+    )
+    WEBHOOK_MAX_RETRIES: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Maximum webhook retry attempts"
+    )
+
     # Logging Configuration
     LOG_DIR: Path = Field(
         default=Path("./logs"),
@@ -129,6 +147,12 @@ class Settings(BaseSettings):
     STATIC_DIR: Path = Field(
         default=Path("./static"),
         description="Directory for static files"
+    )
+
+    # Cookie Management
+    COOKIE_ENCRYPTION_KEY: Optional[str] = Field(
+        default=None,
+        description="AES-256 encryption key for cookies (64 hex chars / 32 bytes)"
     )
 
     @field_validator('API_KEY')
@@ -170,6 +194,23 @@ class Settings(BaseSettings):
                 raise ValueError("PUBLIC_BASE_URL must start with http:// or https://")
         return v
 
+    @field_validator('COOKIE_ENCRYPTION_KEY')
+    @classmethod
+    def validate_encryption_key(cls, v: Optional[str]) -> Optional[str]:
+        """Validate encryption key format."""
+        if v:
+            # Remove whitespace
+            v = v.strip()
+            # Check if it's a valid hex string of correct length (64 hex chars = 32 bytes)
+            if len(v) not in [64, 0]:
+                raise ValueError(
+                    "COOKIE_ENCRYPTION_KEY must be 64 hexadecimal characters (32 bytes for AES-256). "
+                    "Generate with: python -c 'import secrets; print(secrets.token_hex(32))'"
+                )
+            if v and not all(c in '0123456789abcdefABCDEF' for c in v):
+                raise ValueError("COOKIE_ENCRYPTION_KEY must be a hexadecimal string")
+        return v
+
     @property
     def cors_origins_list(self) -> List[str]:
         """Get CORS origins as a list."""
@@ -183,6 +224,11 @@ class Settings(BaseSettings):
         if not self.ALLOWED_DOMAINS:
             return []
         return [domain.strip().lower() for domain in self.ALLOWED_DOMAINS.split(',') if domain.strip()]
+
+    @property
+    def cookies_storage_dir(self) -> Path:
+        """Get cookies storage directory path."""
+        return self.STORAGE_DIR / "cookies"
 
     class Config:
         """Pydantic configuration."""
@@ -255,6 +301,7 @@ def validate_settings() -> None:
         print(f"  - Workers: {settings.WORKERS}")
         print(f"  - Max concurrent downloads: {settings.MAX_CONCURRENT_DOWNLOADS}")
         print(f"  - Authentication: {'Required' if settings.REQUIRE_API_KEY else 'Optional'}")
+        print(f"  - Cookie encryption: {'Enabled' if settings.COOKIE_ENCRYPTION_KEY else 'Auto-generated'}")
 
     except Exception as e:
         raise RuntimeError(f"Configuration validation failed: {e}")

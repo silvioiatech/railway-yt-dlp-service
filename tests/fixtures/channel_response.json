@@ -1,0 +1,79 @@
+{
+  "_type": "playlist",
+  "channel_id": "UC_fixture_channel",
+  "channel": "Fixture Test Channel",
+  "uploader": "Fixture Test Channel",
+  "uploader_id": "fixture_test_channel",
+  "title": "Fixture Test Channel",
+  "description": "This is a fixture channel for testing purposes",
+  "subscriber_count": 500000,
+  "extractor": "youtube:tab",
+  "webpage_url": "https://www.youtube.com/@FixtureChannel",
+  "entries": [
+    {
+      "id": "fixture_vid_001",
+      "title": "Introduction to Testing",
+      "url": "https://youtube.com/watch?v=fixture_vid_001",
+      "webpage_url": "https://youtube.com/watch?v=fixture_vid_001",
+      "duration": 900,
+      "view_count": 150000,
+      "like_count": 5000,
+      "uploader": "Fixture Test Channel",
+      "upload_date": "20251105",
+      "thumbnail": "https://i.ytimg.com/vi/fixture_vid_001/maxresdefault.jpg",
+      "description": "Learn the basics of software testing"
+    },
+    {
+      "id": "fixture_vid_002",
+      "title": "Advanced Testing Techniques",
+      "url": "https://youtube.com/watch?v=fixture_vid_002",
+      "webpage_url": "https://youtube.com/watch?v=fixture_vid_002",
+      "duration": 1800,
+      "view_count": 80000,
+      "like_count": 3500,
+      "uploader": "Fixture Test Channel",
+      "upload_date": "20251103",
+      "thumbnail": "https://i.ytimg.com/vi/fixture_vid_002/maxresdefault.jpg",
+      "description": "Deep dive into advanced testing patterns"
+    },
+    {
+      "id": "fixture_vid_003",
+      "title": "Unit Testing Best Practices",
+      "url": "https://youtube.com/watch?v=fixture_vid_003",
+      "webpage_url": "https://youtube.com/watch?v=fixture_vid_003",
+      "duration": 600,
+      "view_count": 200000,
+      "like_count": 8000,
+      "uploader": "Fixture Test Channel",
+      "upload_date": "20251101",
+      "thumbnail": "https://i.ytimg.com/vi/fixture_vid_003/maxresdefault.jpg",
+      "description": "Best practices for writing unit tests"
+    },
+    {
+      "id": "fixture_vid_004",
+      "title": "Integration Testing Guide",
+      "url": "https://youtube.com/watch?v=fixture_vid_004",
+      "webpage_url": "https://youtube.com/watch?v=fixture_vid_004",
+      "duration": 1200,
+      "view_count": 120000,
+      "like_count": 4500,
+      "uploader": "Fixture Test Channel",
+      "upload_date": "20251030",
+      "thumbnail": "https://i.ytimg.com/vi/fixture_vid_004/maxresdefault.jpg",
+      "description": "Complete guide to integration testing"
+    },
+    {
+      "id": "fixture_vid_005",
+      "title": "E2E Testing Masterclass",
+      "url": "https://youtube.com/watch?v=fixture_vid_005",
+      "webpage_url": "https://youtube.com/watch?v=fixture_vid_005",
+      "duration": 3600,
+      "view_count": 95000,
+      "like_count": 4000,
+      "uploader": "Fixture Test Channel",
+      "upload_date": "20251028",
+      "thumbnail": "https://i.ytimg.com/vi/fixture_vid_005/maxresdefault.jpg",
+      "description": "Comprehensive end-to-end testing masterclass"
+    }
+  ]
+}

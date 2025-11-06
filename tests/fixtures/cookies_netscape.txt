@@ -1,0 +1,12 @@
+# Netscape HTTP Cookie File
+# This is a generated file! Do not edit.
+# Fixture cookies for testing purposes
+
+.youtube.com	TRUE	/	TRUE	1735689600	CONSENT	YES+cb.20210101-08-p0.en+FX+123
+.youtube.com	TRUE	/	FALSE	1735689600	VISITOR_INFO1_LIVE	abcdef123456ghijklmn
+.youtube.com	TRUE	/	TRUE	1735689600	LOGIN_INFO	AFmmF2swRQIhAKTest123Session:1234567890:0
+.youtube.com	TRUE	/	FALSE	1735689600	PREF	f1=50000000&f6=40000000&tz=America.Los_Angeles
+.youtube.com	TRUE	/	TRUE	1735689600	SAPISID	TestSAPISID123/TestHash456
+.youtube.com	TRUE	/	TRUE	1735689600	APISID	TestAPISID789/TestHash012
+.youtube.com	TRUE	/	TRUE	1735689600	SSID	TestSSID345_TestValue678
+.youtube.com	TRUE	/	FALSE	1735689600	SID	TestSID901.TestSessionValue234
