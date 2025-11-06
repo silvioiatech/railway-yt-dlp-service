@@ -1,0 +1,81 @@
+
+{
+  "name": "Ultimate Media Downloader Dev Container",
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "app",
+  "workspaceFolder": "/workspace",
+
+  // Features to install
+  "features": {
+    "ghcr.io/devcontainers/features/python:1": {
+      "version": "3.11"
+    },
+    "ghcr.io/devcontainers/features/git:1": {},
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+
+  // VSCode customizations
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-python.black-formatter",
+        "ms-python.isort",
+        "charliermarsh.ruff",
+        "redhat.vscode-yaml",
+        "tamasfe.even-better-toml",
+        "ms-azuretools.vscode-docker"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "python.linting.enabled": true,
+        "python.linting.pylintEnabled": false,
+        "python.formatting.provider": "black",
+        "python.testing.pytestEnabled": true,
+        "python.testing.unittestEnabled": false,
+        "python.testing.pytestArgs": [
+          "tests",
+          "-v",
+          "--cov=app",
+          "--cov-report=html"
+        ],
+        "editor.formatOnSave": true,
+        "editor.codeActionsOnSave": {
+          "source.organizeImports": true
+        },
+        "[python]": {
+          "editor.defaultFormatter": "ms-python.black-formatter",
+          "editor.tabSize": 4
+        }
+      }
+    }
+  },
+
+  // Forward ports for development
+  "forwardPorts": [8080],
+  "portsAttributes": {
+    "8080": {
+      "label": "FastAPI Application",
+      "onAutoForward": "notify"
+    }
+  },
+
+  // Install system dependencies on container creation
+  "onCreateCommand": "apt-get update && apt-get install -y curl git ca-certificates && rm -rf /var/lib/apt/lists/*",
+
+  // Post-create command to set up the environment
+  "postCreateCommand": "pip install --upgrade pip && pip install -r requirements.txt && pip install -r requirements-test.txt",
+
+  // Post-start command to run the app in the background
+  "postStartCommand": "nohup uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload > /workspace/logs/uvicorn.log 2>&1 &",
+
+  // Set environment variables
+  "containerEnv": {
+    "PYTHONUNBUFFERED": "1",
+    "PYTHONDONTWRITEBYTECODE": "1"
+  },
+
+  // Run as non-root user
+  "remoteUser": "vscode"
+}

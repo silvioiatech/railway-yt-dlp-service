@@ -17,6 +17,7 @@ RUN useradd --create-home --shell /bin/bash --user-group --uid 1000 appuser
 # Create directories
 RUN mkdir -p /var/log/app && chown -R appuser:appuser /var/log/app
 RUN mkdir -p /app && chown -R appuser:appuser /app
+RUN mkdir -p /app/data && chown -R appuser:appuser /app/data
 RUN mkdir -p /tmp/railway-downloads && chown -R appuser:appuser /tmp/railway-downloads
 
 # Set work directory

@@ -1,0 +1,73 @@
+services:
+  app:
+    image: python:3.11-slim
+    
+    command: sleep infinity
+
+    volumes:
+      # Mount workspace
+      - ..:/workspace:cached
+      # Mount data directory for downloads
+      - app-data:/app/data
+      # Mount logs
+      - app-logs:/workspace/logs
+      # Mount test coverage reports
+      - ../htmlcov:/workspace/htmlcov:cached
+
+    working_dir: /workspace
+
+    environment:
+      # Core settings
+      - REQUIRE_API_KEY=false
+      - API_KEY=test-key-local-dev
+
+      # Storage
+      - STORAGE_DIR=/app/data
+      - PUBLIC_BASE_URL=http://localhost:8080
+
+      # Features
+      - ALLOW_YT_DOWNLOADS=true
+      - WEBHOOK_ENABLE=true
+
+      # Concurrency
+      - WORKERS=2
+      - MAX_CONCURRENT_DOWNLOADS=3
+
+      # CORS for local development
+      - CORS_ORIGINS=http://localhost:3000,http://localhost:8080,http://127.0.0.1:8080
+
+      # Logging
+      - LOG_LEVEL=DEBUG
+      - DEBUG=true
+
+      # Rate limiting (relaxed for testing)
+      - RATE_LIMIT_RPS=10
+      - RATE_LIMIT_BURST=20
+
+      # File retention (1 hour for testing)
+      - FILE_RETENTION_HOURS=1.0
+
+    ports:
+      - "8080:8080"
+
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+
+    # Network
+    networks:
+      - app-network
+
+volumes:
+  app-data:
+    driver: local
+  app-logs:
+    driver: local
+
+networks:
+  app-network:
+    driver: bridge
